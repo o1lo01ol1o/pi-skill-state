@@ -3,7 +3,13 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { MODE_ENTRY_TYPE, reconstructBranch, type Reconstruction } from "../src/core/fold.js";
 import { inactiveMode } from "../src/core/mode.js";
-import { assemblePrompt, STATE_NUDGE, type ContextItem, type PromptMessage } from "../src/core/prompt.js";
+import {
+  assemblePrompt,
+  renderProcedure,
+  STATE_NUDGE,
+  type ContextItem,
+  type PromptMessage,
+} from "../src/core/prompt.js";
 
 async function enteredFixture() {
   return JSON.parse(await readFile(new URL("./fixtures/mode-entered-v1.json", import.meta.url), "utf8"));
@@ -79,9 +85,11 @@ test("active prompt is bounded, strips prose/thinking, retains steers, and keeps
   ];
 
   const prompt = assemblePrompt(items, reconstructed.value);
-  assert.match(String(prompt[0]!.content), /skill-state-procedure/);
-  assert.match(String(prompt[0]!.content), /References are relative to \/skills\/counter/);
-  assert.match(String(prompt[1]!.content), /"count":0/);
+  assert.match(String(prompt[0]!.content), /skill-state-current/);
+  assert.match(String(prompt[0]!.content), /"count":0/);
+  assert.equal(JSON.stringify(prompt).includes("skill-state-procedure"), false, "P lives in the system prompt, not the message array");
+  assert.match(renderProcedure(reconstructed.value.active), /skill-state-procedure/);
+  assert.match(renderProcedure(reconstructed.value.active), /References are relative to \/skills\/counter/);
   assert.ok(prompt.includes(steer));
   assert.equal(prompt.some((item) => String(item.content).startsWith("<skill name=")), false);
   assert.equal(prompt.some((item) => item.toolCallId === "old"), false);
@@ -119,7 +127,7 @@ test("window preserves original pairing order and omits incomplete assistant too
     message("r2", toolResult(1, "two")),
     message("a3", assistant(1, "incomplete")),
   ], reconstructed.value);
-  const window = prompt.slice(2).filter((item) => item.role === "assistant" || item.role === "toolResult");
+  const window = prompt.slice(1).filter((item) => item.role === "assistant" || item.role === "toolResult");
   assert.deepEqual(
     window.map((item) =>
       item.role === "assistant"

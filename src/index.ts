@@ -41,6 +41,8 @@ import {
 } from "./core/mode.js";
 import {
   assemblePrompt,
+  procedureMessage,
+  renderProcedure,
   RUNTIME_CONTRACT,
   type ContextItem,
   type PromptMessage,
@@ -258,7 +260,8 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
   pi.registerTool({
     name: COMPLETE_TOOL,
     label: "Skill Complete",
-    description: "Complete the active bounded-state skill episode with a concise retained result",
+    description:
+      "Complete the active bounded-state skill episode with a concise retained result. Call it only when the procedure goal is fully achieved, as the only tool call in its message; record final facts with state_patch in an earlier message.",
     promptSnippet: "Complete the active skill episode and retain its concise result",
     parameters: CompleteParams,
     executionMode: "sequential",
@@ -390,11 +393,15 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
 
   pi.on("before_agent_start", (event, ctx) => {
     try {
-      if (!reconstruct(ctx).active) return;
-      return { systemPrompt: `${event.systemPrompt}\n\n${RUNTIME_CONTRACT}` };
+      const active = reconstruct(ctx).active;
+      if (!active) return;
+      // P rides the system prompt: pi's provider conversion puts durable cache
+      // breakpoints only on system/tool blocks, so a message-array P would be
+      // re-priced every time Σ changes.
+      return { systemPrompt: `${event.systemPrompt}\n\n${RUNTIME_CONTRACT}\n\n${renderProcedure(active)}` };
     } catch (error) {
       notifyFailure(ctx, error);
-      return { systemPrompt: `${event.systemPrompt}\n\nSkill-state reconstruction is blocked. Do not execute tools.` };
+      return { systemPrompt: `${event.systemPrompt}\n\nSkill-state reconstruction is blocked. Do not call tools; report the failure to the user and stop.` };
     }
   });
 
@@ -409,7 +416,11 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
       setStatus(ctx, "Σ blocked");
       notify(ctx, text, "error");
       return {
-        messages: [{ role: "user", content: `Skill-state is blocked: ${text}`, timestamp: Date.now() }] as typeof event.messages,
+        messages: [{
+          role: "user",
+          content: `Skill-state is blocked and tool calls are disabled: ${text}\nReport this failure to the user and stop.`,
+          timestamp: Date.now(),
+        }] as typeof event.messages,
       };
     }
   });
@@ -469,10 +480,13 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
     if (!summaryTouchesEpisode(event, branch, reconstructed.value)) return;
 
     try {
-      const safeMessages = assemblePrompt(
+      const assembled = assemblePrompt(
         timelineFromEntries(safeTreeEntries(event, branch, reconstructed.value)),
         reconstructed.value,
       );
+      const safeMessages = reconstructed.value.active
+        ? [procedureMessage(reconstructed.value.active), ...assembled]
+        : assembled;
       const summarized = await summarizeSafeMessages(
         ctx,
         safeMessages,
@@ -534,10 +548,11 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
       name: STATE_PATCH_TOOL,
       label: "State Patch",
       description:
-        "Atomically update bounded skill state with tagged operations. Each operation has an RFC 6901 path, JSON-encoded value string, and action matching the field policy: lww→lww-set/lww-delete, append→append, union→union, sum→sum, max→max, once→once.",
+        "Atomically update bounded skill state with tagged operations. Each operation names an RFC 6901 path to a state field, the action required by that field's merge policy (policies are listed in the state block), and the payload as JSON text. Payload by action: lww-set replaces the whole field; lww-delete deletes it (value null); append and union add an array of new items only; sum adds an integer delta, never the new total; max proposes a candidate number; once sets a single permanent value. Any error rejects the whole call.",
       promptSnippet: "Atomically update bounded skill state using tagged policy operations",
       promptGuidelines: [
-        "Use state_patch to record facts before observations leave the bounded window; operation value fields contain JSON text.",
+        "Record facts with state_patch in the same turn you observe them; the observation window slides and unrecorded observations disappear.",
+        "state_patch value fields are JSON text (strings stay quoted); send deltas for policy fields, never the merged result.",
       ],
       parameters: schema.patchSchema,
       ...(constrainedSampling
@@ -874,7 +889,7 @@ async function summarizeSafeMessages(
           role: "user",
           content: [{
             type: "text",
-            text: `Summarize the safe conversation view below for ${purpose}. Preserve goals, constraints, decisions, files changed, verification, blockers, and next steps. Do not invent or refer to hidden transcript content. The skill-state episode blocks are authoritative sufficient statistics.${focus}\n\n<conversation>\n${conversation}\n</conversation>`,
+            text: `Summarize the safe conversation view below for ${purpose}. Preserve goals, constraints, decisions, files changed, verification, blockers, and next steps. Do not invent or refer to hidden transcript content. Treat <skill-state-episode> and <skill-state-result> blocks as the complete, authoritative record of those episodes; do not speculate about what happened inside them.${focus}\n\n<conversation>\n${conversation}\n</conversation>`,
           }],
           timestamp: Date.now(),
         }],

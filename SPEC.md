@@ -71,8 +71,8 @@ auditability and branch replay are retained for free.
                                        ▼
    mode Inactive ──────────── context handler ──────────── mode Active(run)
    pass through, but                                       assemble bounded view:
-   collapse completed            fold accepted               [ system + runtime contract ]
-   episode spans to              state_patch calls           [ P: skill body + task args ]
+   collapse completed            fold accepted               [ system prompt + contract  ]
+   episode spans to              state_patch calls           [   + P (skill body + args) ]
    (P-header, Σ_final,           along active branch         [ Σ_t rendered canonically  ]
     result)                          │                       [ user steers since entry   ]
                                      ▼                       [ window: last k turns'     ]
@@ -214,14 +214,14 @@ is required for deterministic replay after skill files change or disappear.
 **Steady state** — per turn, the `context` handler assembles, from the transcript
 copy it receives plus the folded Σ (pure function; no hidden state):
 
-1. System prompt: pi's base prompt (unchanged) + the runtime contract (appendix A),
-   appended via `before_agent_start`'s `systemPrompt` chain while Active.
-2. One user message containing P — byte-stable across the whole episode
-   (prompt-cache-friendly prefix).
-3. One user message containing `render(Σ_t)` with its schema-derived field notes.
-4. All *steering* user messages sent since mode entry, verbatim, in order. The
+1. System prompt: pi's base prompt (unchanged) + the runtime contract (appendix A)
+   + P, appended via `before_agent_start`'s `systemPrompt` chain while Active.
+   P is byte-stable across the whole episode and rides the system prompt so it
+   sits inside the provider cache breakpoint (§10, decision 14).
+2. One user message containing `render(Σ_t)` with its schema-derived field notes.
+3. All *steering* user messages sent since mode entry, verbatim, in order. The
    invoking `/skill:name` message is excluded because its body and arguments are P.
-5. The observation window: the last **k** turns' assistant messages with prose and
+4. The observation window: the last **k** turns' assistant messages with prose and
    thinking blocks **stripped** but tool-call blocks retained, each followed by its
    tool results — retaining a_t and O_t while discarding R_t, and keeping
    call/result pairing valid for every provider.
@@ -331,7 +331,9 @@ metadata:
   deterministic collapsed view, with cuts adjusted so episodes are never split.
   `session_before_tree` likewise detects abandoned spans touching active/completed
   episodes and summarizes an abandoned-span-only safe bounded/collapsed view instead
-  of raw entries; unrelated common-prefix messages are excluded.
+  of raw entries (with P prepended as a message when the span covers an active
+  episode, since per-turn prompts carry P in the system prompt); unrelated
+  common-prefix messages are excluded.
   Either path fails closed by cancelling when a safe summary cannot be produced.
 - **Other history/summary-rewriting extensions:** `context` and `session_before_*`
   handlers chain in extension load order. skill-state is **not composition-safe**
@@ -371,9 +373,14 @@ Mapping the paper's measured error taxonomy (its Experiment 7) to this design:
   k is constant; steers are human-bounded. Independent of episode horizon T —
   the paper's bounded-footprint property.
 - Cumulative episode tokens: O(T).
-- Prefix stability: system prompt + P are byte-identical across the episode and sit
-  first, so provider prompt caching covers the largest fixed block. Σ (which
-  changes) is placed after the stable prefix, before the window.
+- Prefix stability: the system prompt (base + contract + P) is byte-identical
+  across the episode. P lives inside the system prompt because pi's provider
+  conversion places durable cache breakpoints only on the system and tool blocks,
+  plus a rolling breakpoint on the last user message that Σ mutation defeats every
+  patch turn — a message-array P would therefore never be served from cache on
+  Anthropic-style providers (OpenAI-style automatic prefix caching covers it in
+  either position). Σ (which changes) is the first message, before steers and the
+  window.
 
 ---
 
@@ -510,6 +517,15 @@ enforces rather than requests wherever possible:
 13. **Completion is explicit** (`skill_complete`), not inferred by a judge model —
    consistent with the local doctrine (cf. pi-loop-antidote) that no LLM arbitrates
    control flow.
+14. **P is injected into the system prompt, not sent as a leading user message.**
+    Rationale in §10: pi's breakpoint placement would otherwise re-price P at full
+    input cost every patch turn on Anthropic-style providers. Cost: the system-block
+    cache entry is invalidated at episode entry and exit — already true because the
+    runtime contract changes it at the same moments. Active-episode branch
+    summaries re-attach P explicitly (§8). Steers remain *after* Σ despite being
+    more cache-stable: user instructions stay adjacent to the working context, and
+    human-typed steers are small; this is the one deliberately non-cache-optimal
+    ordering.
 
 ## 15. Out of scope (v1) / future work
 
@@ -525,17 +541,20 @@ enforces rather than requests wherever possible:
 
 ---
 
-## Appendix A — runtime contract (sketch, injected while Active)
+## Appendix A — runtime contract (verbatim, injected while Active)
 
 > You are executing the procedure below under a bounded-state runtime. Your context
-> contains only: the procedure, the current execution state, your instructions from
-> the user, and your last few actions with their results. **Older history is not
-> visible and will not return.** Any fact you need later — discoveries, decisions,
-> progress, hypotheses ruled out — must be written into state with `state_patch`
-> before it leaves the window. Keep state minimal and current: remove or compact
-> entries that no longer matter (fields marked append/union/sum/max take deltas and
-> cannot be overwritten). When the procedure's goal is achieved, call
-> `skill_complete` with a concise result.
+> contains only the procedure, the current execution state, instructions from the
+> user, and your last few actions with their results. Older history is not visible
+> and will not return. Record every fact you will need later with `state_patch` in
+> the same turn you learn it, before it leaves the window. The state block lists
+> each field's merge policy. Policy fields cannot be overwritten or deleted; send
+> only the change: new items for append/union, the amount to add for sum, a
+> candidate for max, the single permanent value for once. lww fields are replaced
+> whole with lww-set or removed with lww-delete. An invalid patch is rejected whole
+> with the reasons; fix and resend. Keep state minimal and current. When the
+> procedure goal is achieved, call `skill_complete` as the only tool call in that
+> message, with a concise result.
 
 ## Appendix B — example skill schema
 
@@ -574,7 +593,7 @@ accumulators cannot be clobbered; the baseline is write-once.
    `state_patch {operations:[{path:"/shelves_done",action:"union",value:"[\\"7-01\\"]"},{path:"/items_counted",action:"sum",value:"42"}]}`.
 3. Turn 5: model emits action `lww-delete` for `/shelves_done` — **rejected at B2**
    because that path has policy `union`; the retry error names the action and path.
-4. Turn 6: context = system+contract · P · Σ (5 shelves, 214 items) · window of
+4. Turn 6: context = system+contract+P · Σ (5 shelves, 214 items) · window of
    turns 4–5. Turn 1's transcript is gone; its facts live in Σ.
 5. Turn 41: `skill_complete {result: "aisle 7 audited; 3 defects"}` →
    `mode-exited` appended with final Σ.

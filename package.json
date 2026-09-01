@@ -4,6 +4,13 @@
   "private": true,
   "description": "Bounded, schema-validated execution state for procedural pi skills.",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/o1lo01ol1o/pi-skill-state.git"
+  },
   "scripts": {
     "check": "tsc --noEmit",
     "test": "tsx --test tests/*.test.ts",

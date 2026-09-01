@@ -72,8 +72,11 @@ object, and array constraints are implemented in `src/core/schema.ts`; unsupport
 keywords are rejected when the skill arms. `sum` fields must use `type: integer` and
 all sums stay within JavaScript's safe-integer range.
 
-See [`skills/warehouse-audit`](skills/warehouse-audit/) for a complete example and
-[`SPEC.md`](SPEC.md) for the runtime protocol and trade-offs.
+See [`skills/warehouse-audit`](skills/warehouse-audit/) for a complete example,
+[`skills/skill-state-guide`](skills/skill-state-guide/) (`/skill:skill-state-guide`)
+for the authoring guide — schema design, merge-policy selection, procedure
+writing, debugging — and [`SPEC.md`](SPEC.md) for the runtime protocol and
+trade-offs.
 
 ## Compatibility boundary
 
@@ -83,6 +86,53 @@ that rewrites `context` or independently handles `session_before_compact` /
 rewriter could observe raw episode entries or replace the safe projection. Extensions
 that merely request pi's normal compaction remain compatible because skill-state
 still owns the resulting event.
+
+## Performance and prompt caching: what to expect
+
+While an episode is active, the per-turn prompt is O(1) in episode length —
+(procedure + state + a k-turn window) — instead of a growing transcript, and
+cumulative episode tokens are O(T) instead of O(T²). You can watch this in pi's
+normal footer: the context figure comes from the provider's reported usage of
+the last call, so it **drops to the bounded prompt's size on the first response
+of an episode and stays roughly flat** for the rest of it. After completion,
+later turns see only a collapsed (header, final state, result) block, so the
+savings persist for the remainder of the session.
+
+Cache behavior, by design:
+
+- The system prompt (pi base + runtime contract + the frozen procedure) and the
+  tool schemas are byte-stable for the whole episode. On Anthropic-style
+  providers they sit inside the durable cache breakpoints; OpenAI-style prefix
+  caching covers them automatically. These should be served at cache-read price
+  every turn.
+- Full cache invalidation happens exactly twice per episode: at entry and at
+  exit (the system prompt and toolset change there).
+- The state message and everything after it (steers, window) re-price whenever
+  state changes — that is the bounded payload and it is expected to be small.
+  Steers sit after state deliberately (instruction adjacency over cacheability);
+  see SPEC.md §14 for the trade-offs.
+
+**If reality doesn't match this** — the footer keeps climbing mid-episode, the
+skill body is billed at full input price every turn, cache reads don't cover the
+system prompt, or measured usage is far off the O(1)/O(T) claims — that is a bug
+or a regression we want to know about. Please open an issue or, better, a PR
+with: the provider and model, the session JSONL (or a redacted excerpt), and the
+per-turn usage numbers (input / cache-read / cache-write). The same goes for any
+cache invalidation you can attribute to this extension where the design above
+says there shouldn't be one.
+
+## Known issues
+
+- Aborting mid-turn (Esc) while an assistant message still has unexecuted
+  `state_patch` calls can leave a dangling proposal that wedges branch
+  reconstruction ("Skill-state is blocked"). Workaround: `/tree`-navigate above
+  the aborted message. A fold-level fix (expiring never-resolved proposals) is
+  planned; PRs welcome.
+
+## Requirements
+
+Node ≥ 22 to run the test suite (pi-coding-agent's bundled undici needs it);
+the extension itself runs inside pi's own runtime.
 
 ## Verify
 

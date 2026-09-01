@@ -8,10 +8,10 @@ export type ContextItem =
   | Readonly<{ kind: "message"; entryId: string; message: PromptMessage }>
   | Readonly<{ kind: "marker"; entryId: string }>;
 
-export const RUNTIME_CONTRACT = `You are executing the procedure below under a bounded-state runtime. Your context contains only the procedure, the current execution state, instructions from the user, and your last few actions with their results. Older history is not visible and will not return. Record every fact you will need later with state_patch before it leaves the window. Policy fields accept deltas only. Keep state minimal and current. When the procedure goal is achieved, call skill_complete with a concise result.`;
+export const RUNTIME_CONTRACT = `You are executing the procedure below under a bounded-state runtime. Your context contains only the procedure, the current execution state, instructions from the user, and your last few actions with their results. Older history is not visible and will not return. Record every fact you will need later with state_patch in the same turn you learn it, before it leaves the window. The state block lists each field's merge policy. Policy fields cannot be overwritten or deleted; send only the change: new items for append/union, the amount to add for sum, a candidate for max, the single permanent value for once. lww fields are replaced whole with lww-set or removed with lww-delete. An invalid patch is rejected whole with the reasons; fix and resend. Keep state minimal and current. When the procedure goal is achieved, call skill_complete as the only tool call in that message, with a concise result.`;
 
 export const STATE_NUDGE =
-  "Record any facts from the recent tool observations that you will need later with state_patch now; the observation window will slide.";
+  "Record any facts from the recent tool observations that you will need later with state_patch now; the oldest turn in your view is about to leave the window.";
 
 export function assemblePrompt(items: readonly ContextItem[], reconstruction: Reconstruction): PromptMessage[] {
   if (reconstruction.active) return assembleActive(items, reconstruction.active);
@@ -22,6 +22,11 @@ export function renderProcedure(active: ActiveRuntime): string {
   const { entered } = active.mode;
   const args = entered.procedure.args ? `\n\nTask arguments:\n${entered.procedure.args}` : "";
   return `<skill-state-procedure name=${JSON.stringify(entered.skillName)} location=${JSON.stringify(entered.procedure.skillPath)} schema-hash=${JSON.stringify(entered.schemaHash)}>\nReferences are relative to ${entered.procedure.skillBaseDir}.\n\n${entered.procedure.skillBody}${args}\n</skill-state-procedure>`;
+}
+
+/** P as a message, for summarizer paths; per-turn prompts carry P in the system prompt instead. */
+export function procedureMessage(active: ActiveRuntime): PromptMessage {
+  return syntheticUser(renderProcedure(active), active.mode.entered.enteredAt);
 }
 
 export function renderStateView(active: ActiveRuntime): string {
@@ -97,7 +102,6 @@ function assembleActive(items: readonly ContextItem[], active: ActiveRuntime): P
   });
 
   const prompt: PromptMessage[] = [
-    syntheticUser(renderProcedure(active), active.mode.entered.enteredAt),
     syntheticUser(renderStateView(active), active.mode.entered.enteredAt + 1),
     ...userMessages,
     ...windowMessages,
@@ -125,9 +129,10 @@ function collapseCompleted(
     if (item.kind === "marker") {
       const episode = byEntered.get(item.entryId);
       if (!episode) continue;
+      const args = episode.entered.procedure.args;
       result.push(
         syntheticUser(
-          `<skill-state-episode name=${JSON.stringify(episode.entered.skillName)}>executed with args ${JSON.stringify(episode.entered.procedure.args)}</skill-state-episode>`,
+          `<skill-state-episode name=${JSON.stringify(episode.entered.skillName)}>Executed skill ${JSON.stringify(episode.entered.skillName)}${args ? ` with arguments ${JSON.stringify(args)}` : ""}.</skill-state-episode>`,
           episode.entered.enteredAt,
         ),
         syntheticUser(

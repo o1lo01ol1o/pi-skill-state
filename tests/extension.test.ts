@@ -170,6 +170,8 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
     systemPromptOptions: {},
   }) as { systemPrompt: string };
   assert.match(before.systemPrompt, /bounded-state runtime/);
+  assert.match(before.systemPrompt, /skill-state-procedure/);
+  assert.match(before.systemPrompt, /Warehouse Audit/);
 
   const patchArgs = {
     operations: [
@@ -249,6 +251,7 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
   assert.equal(safeTree.summary?.details.kind, "skill-state/safe-branch-summary");
   assert.equal(capturedCompactionPrompt.includes("discard me"), false);
   assert.match(capturedCompactionPrompt, /skill-state-current/);
+  assert.match(capturedCompactionPrompt, /skill-state-procedure/, "active-episode summaries carry P explicitly");
 
   const scopedTree = await invoke("session_before_tree", {
     type: "session_before_tree",

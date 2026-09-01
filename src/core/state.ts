@@ -21,6 +21,7 @@ import {
 } from "./json.js";
 import {
   canonicalScalarUnion,
+  hasProtectedDescendant,
   normalizeStateObject,
   type SchemaNode,
   type StateSchema,
@@ -457,12 +458,6 @@ function allowedActions(node: SchemaNode): readonly PatchAction[] {
   if (node.policy !== "lww") return [node.policy];
   if (node.type === "object" && hasProtectedDescendant(node)) return [];
   return ["lww-set", "lww-delete"];
-}
-
-function hasProtectedDescendant(node: SchemaNode): boolean {
-  return Object.values(node.properties).some(
-    (child) => child.policy !== "lww" || hasProtectedDescendant(child),
-  );
 }
 
 function isPatchAction(value: string): value is PatchAction {

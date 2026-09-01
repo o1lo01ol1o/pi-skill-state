@@ -114,7 +114,7 @@ test("50-turn bundled warehouse run keeps prompt footprint flat and reaches grou
 
     const projected = assemblePrompt(timeline, { mode, active, completed: [] });
     promptSizes.push(JSON.stringify(projected).length);
-    assert.ok(projected.length <= 6, `turn ${turn} retained too many messages`);
+    assert.ok(projected.length <= 5, `turn ${turn} retained too many messages`);
     assert.equal(JSON.stringify(projected).includes("reasoning turn 1"), false);
   }
 

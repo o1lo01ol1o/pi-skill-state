@@ -148,6 +148,44 @@ test("B1 rejects unsafe-integer sum defaults", () => {
   }
 });
 
+test("policy notes list exactly the operable fields: no array interiors, no protected containers", () => {
+  const parsed = parseStateSchema(JSON.stringify({
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      defects: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: { shelf: { type: "string" }, issue: { type: "string" } },
+          required: ["shelf", "issue"],
+        },
+        default: [],
+        "x-skill-state": { merge: "append" },
+      },
+      group: {
+        type: "object",
+        additionalProperties: false,
+        properties: {
+          log: { type: "array", items: { type: "string" }, default: [], "x-skill-state": { merge: "append" } },
+        },
+      },
+      nested: {
+        type: "object",
+        additionalProperties: false,
+        properties: { a: { type: "number" } },
+      },
+    },
+  }));
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  assert.deepEqual(
+    parsed.value.policyNotes.map(({ path, policy }) => `${path}: ${policy}`),
+    ["/defects: append", "/group/log: append", "/nested: lww", "/nested/a: lww"],
+  );
+});
+
 test("schema hash is canonical over object key order", () => {
   const left = parseStateSchema('{"type":"object","additionalProperties":false,"properties":{}}');
   const right = parseStateSchema('{"properties":{},"additionalProperties":false,"type":"object"}');

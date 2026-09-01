@@ -404,18 +404,21 @@ function operationPatchSchema(): JsonObject {
       operations: {
         type: "array",
         minItems: 1,
+        description: "Tagged operations applied in order; the whole call succeeds or fails atomically",
         items: {
           type: "object",
           additionalProperties: false,
           properties: {
-            path: { type: "string", description: "RFC 6901 pointer to a state field" },
+            path: { type: "string", description: "RFC 6901 pointer to a state field, e.g. /items_counted" },
             action: {
               type: "string",
               enum: ["lww-set", "lww-delete", "append", "union", "sum", "max", "once"],
+              description: "Must match the field's merge policy; lww fields take lww-set or lww-delete",
             },
             value: {
               type: "string",
-              description: "JSON-encoded operation payload; lww-delete requires null",
+              description:
+                'JSON text of the payload; strings stay quoted, e.g. "\\"scan\\"". lww-set: full replacement value; lww-delete: null; append/union: array of new items only; sum: integer amount to add, not the new total; max: candidate number; once: the single permanent value',
             },
           },
           required: ["path", "action", "value"],
@@ -426,13 +429,23 @@ function operationPatchSchema(): JsonObject {
   };
 }
 
+export function hasProtectedDescendant(node: SchemaNode): boolean {
+  return Object.values(node.properties).some(
+    (child) => child.policy !== "lww" || hasProtectedDescendant(child),
+  );
+}
+
+/** Only fields a patch operation can actually address: no array interiors, no protected containers. */
 function collectPolicyNotes(root: SchemaNode): readonly Readonly<{ path: string; policy: MergePolicy }>[] {
   const notes: Array<Readonly<{ path: string; policy: MergePolicy }>> = [];
   const visit = (node: SchemaNode): void => {
     for (const child of Object.values(node.properties)) {
+      if (child.policy === "lww" && child.type === "object") {
+        if (!hasProtectedDescendant(child)) notes.push({ path: child.path, policy: child.policy });
+        visit(child);
+        continue;
+      }
       notes.push({ path: child.path, policy: child.policy });
-      visit(child);
-      if (child.items) visit(child.items);
     }
   };
   visit(root);
