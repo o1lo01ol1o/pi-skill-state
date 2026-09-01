@@ -1,0 +1,10 @@
+{
+  "v": 1,
+  "kind": "mode-exited",
+  "runId": "run-001",
+  "schemaHash": "ba412ad05b7a984456dddf632b9b9285faa2650f5a6450e5d1d378e5c64a39e3",
+  "outcome": "completed",
+  "result": "counted 2 items",
+  "finalState": "{\"count\":2}",
+  "exitedAt": 1700000005000
+}

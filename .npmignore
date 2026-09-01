@@ -1,0 +1,6 @@
+.claude/
+.pi/
+tests/
+tsconfig.json
+coverage/
+*.log

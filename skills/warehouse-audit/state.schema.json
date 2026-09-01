@@ -1,0 +1,42 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "working_dir": { "type": "string" },
+    "phase": {
+      "type": "string",
+      "enum": ["scan", "fix", "verify"],
+      "default": "scan"
+    },
+    "shelves_done": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": [],
+      "x-skill-state": { "merge": "union" }
+    },
+    "defects_found": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "shelf": { "type": "string" },
+          "issue": { "type": "string" }
+        },
+        "required": ["shelf", "issue"]
+      },
+      "default": [],
+      "x-skill-state": { "merge": "append" }
+    },
+    "items_counted": {
+      "type": "integer",
+      "default": 0,
+      "x-skill-state": { "merge": "sum" }
+    },
+    "baseline_commit": {
+      "type": "string",
+      "x-skill-state": { "merge": "once" }
+    },
+    "notes": { "type": "string" }
+  }
+}

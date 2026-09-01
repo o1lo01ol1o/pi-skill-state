@@ -1,0 +1,22 @@
+{
+  "v": 1,
+  "kind": "mode-entered",
+  "runId": "run-001",
+  "skillName": "counter",
+  "schemaHash": "ba412ad05b7a984456dddf632b9b9285faa2650f5a6450e5d1d378e5c64a39e3",
+  "source": "command",
+  "enteredAt": 1700000000000,
+  "procedure": {
+    "skillPath": "/skills/counter/SKILL.md",
+    "skillBaseDir": "/skills/counter",
+    "schemaPath": "/skills/counter/state.schema.json",
+    "skillBody": "# Counter\n\nCount carefully.",
+    "schemaBytes": "{\"type\":\"object\",\"additionalProperties\":false,\"properties\":{\"count\":{\"type\":\"integer\",\"default\":0,\"x-skill-state\":{\"merge\":\"sum\"}}}}",
+    "args": "target=2"
+  },
+  "config": {
+    "windowTurns": 2,
+    "budgetTokens": 4000,
+    "constrainedSampling": false
+  }
+}
