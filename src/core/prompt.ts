@@ -1,4 +1,4 @@
-import { ACCEPTED_PATCH_KIND, type ActiveRuntime, type CompletedEpisode, type Reconstruction } from "./fold.js";
+import { type ActiveRuntime, type CompletedEpisode, type Reconstruction } from "./fold.js";
 import { isJsonObject } from "./json.js";
 import { renderState } from "./state.js";
 
@@ -103,7 +103,7 @@ function assembleActive(items: readonly ContextItem[], active: ActiveRuntime): P
     ...windowMessages,
   ];
 
-  if (shouldNudge(messages, selectedAssistantIndices, active.mode.entered.config.windowTurns)) {
+  if (shouldNudge(messages, selectedAssistantIndices, active)) {
     prompt.push(syntheticUser(STATE_NUDGE, newestTimestamp(prompt) + 1));
   }
   return prompt;
@@ -146,28 +146,21 @@ function collapseCompleted(
 function shouldNudge(
   messages: readonly Readonly<{ message: PromptMessage }>[],
   selectedAssistantIndices: readonly number[],
-  windowTurns: number,
+  active: ActiveRuntime,
 ): boolean {
   if (selectedAssistantIndices.length === 0) return false;
   const allAssistantCount = messages.filter(({ message }) => message.role === "assistant").length;
-  if (allAssistantCount < windowTurns) return false;
-  const latestIndex = selectedAssistantIndices[selectedAssistantIndices.length - 1]!;
-  const latest = messages[latestIndex]!.message;
-  const calls = toolCalls(latest);
+  if (allAssistantCount < active.mode.entered.config.windowTurns) return false;
+  const atRiskIndex = selectedAssistantIndices[0]!;
+  const atRisk = messages[atRiskIndex]!.message;
+  const calls = toolCalls(atRisk);
   if (calls.length === 0) return false;
-  const ids = new Set(calls.map((call) => call.id));
-  return !messages.some(({ message }) => {
-    if (
-      message.role !== "toolResult" ||
-      typeof message.toolCallId !== "string" ||
-      !ids.has(message.toolCallId) ||
-      message.isError === true ||
-      !isJsonObject(message.details)
-    ) {
-      return false;
-    }
-    return message.details.kind === ACCEPTED_PATCH_KIND;
-  });
+  const statePatchIds = new Set(
+    calls
+      .filter((call) => call.raw.name === "state_patch")
+      .map((call) => call.id),
+  );
+  return ![...statePatchIds].some((callId) => active.acceptedPatchCallIds.has(callId));
 }
 
 function toolCalls(message: PromptMessage): Array<{ id: string; raw: Readonly<Record<string, unknown>> }> {

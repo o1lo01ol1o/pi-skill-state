@@ -233,6 +233,8 @@ paper's forcing function and is stated plainly in the runtime contract.
 more tagged operations; calls in one assistant message apply in emission order.
 Successful result details attest version, run, schema hash, and state token estimate;
 the fold replays only matching non-error results and their recorded call arguments.
+Persisted results must occur in proposal-emission order; duplicate or out-of-order
+results are malformed B3 input and block reconstruction.
 
 **Nudge:** if a turn ends with tool executions but no accepted `state_patch`, and the
 next turn's window would evict unrecorded observations, the context handler injects a
@@ -303,8 +305,10 @@ metadata:
 
 - **Source of truth for Σ:** the session log itself. Recorded `state_patch` calls are
   proposals; a matching non-error result with versioned acceptance details is the
-  acceptance fact. The fold pairs them by call ID and re-applies operations in branch
-  order. No duplicate patch custom entry is written.
+  acceptance fact. The fold pairs them by call ID, requires result order to match
+  proposal-emission order, and re-applies operations in that order. Duplicate,
+  orphaned, or out-of-order results fail loudly. No duplicate patch custom entry is
+  written.
 - **Custom entries (B3)** record facts not otherwise reconstructible: `mode-entered`
   snapshots run ID, skill identity, exact P, schema bytes/hash, source, and run config;
   `mode-exited` stores outcome, result, and final rendered Σ. Both are wire-versioned
@@ -326,13 +330,18 @@ metadata:
   After exit, branches containing completed episodes use a custom compaction over the
   deterministic collapsed view, with cuts adjusted so episodes are never split.
   `session_before_tree` likewise detects abandoned spans touching active/completed
-  episodes and summarizes the safe bounded/collapsed view instead of raw entries.
+  episodes and summarizes an abandoned-span-only safe bounded/collapsed view instead
+  of raw entries; unrelated common-prefix messages are excluded.
   Either path fails closed by cancelling when a safe summary cannot be produced.
-- **Other transcript-rewriting extensions:** `context` handlers chain in extension
-  load order. skill-state's rewrite is **not composition-safe** with another
-  extension that also rewrites history (e.g. hypothetical transcript pruners); this
-  is documented, not silently absorbed. pi-smart-compact (compaction-time) and
-  context-mode (tool-level) do not conflict structurally.
+- **Other history/summary-rewriting extensions:** `context` and `session_before_*`
+  handlers chain in extension load order. skill-state is **not composition-safe**
+  with another extension that rewrites model history or independently summarizes
+  raw branches: a later result can replace the bounded view, while an earlier
+  summarizer may already have observed raw episode entries. The privacy contract
+  therefore requires skill-state to be the sole history/compaction/tree-summary
+  rewriter. Tool-level extensions that merely request pi's normal compaction remain
+  compatible because this extension still owns the resulting event; context-mode's
+  tool-result indexing does not rewrite session history.
 - **pi-loop-antidote:** operates on assistant-stream pathology and quarantines
   messages; quarantined messages are simply absent from the transcript copy the fold
   sees. No coupling.
@@ -390,6 +399,8 @@ pi-skill-state/
     index.ts              # shell: hooks (context, before_agent_start, input, session_*), tools, commands, flags, UI
   skills/
     warehouse-audit/      # bundled long-horizon smoke/acceptance skill and schema
+  scripts/
+    verify-live-session.mjs # persisted real-pi protocol-evidence checker
   tests/
     acceptance.test.ts    # 50-turn bounded-footprint and ground-truth acceptance
     state.test.ts         # generated accepted traces, laws, closure, policies, render round-trip
@@ -398,13 +409,16 @@ pi-skill-state/
     prompt.test.ts        # window assembly, prose stripping keeps call/result pairing, collapse
     entries.test.ts       # B3 golden wire fixtures (v1), unknown-version rejection
     extension.test.ts     # shell wiring against a scripted session harness
+    live-session.test.ts  # exact persisted-evidence checker accept/reject corpus
 ```
 
 Effect notes: `Date.now`/randomness only for runIds in the shell; the core takes
 them as arguments. No filesystem access in core (schema bytes are read by the shell,
 parsed by the core). Errors are sums, never strings; every boundary error renders to
 both a tool error (model-facing) and a UI notification (human-facing) from the same
-structured value.
+structured value. A mode-entry/exit persistence failure is converted to a structured
+`boundary-io` error and blocks tools/context for that session, so a host write that
+fails after mutating in-memory session state cannot start an undurable episode.
 
 ---
 
@@ -431,20 +445,23 @@ enforces rather than requests wherever possible:
   golden wire fixtures committed and version-pinned; B4 render/parse round-trip as a
   property.
 - **Fold tests:** replay determinism; branch fork mid-episode reconstructs the
-  correct Σ; failed `state_patch` results are excluded; schema-hash mismatch
-  detected.
+  correct Σ; failed `state_patch` results are excluded; out-of-order/duplicate
+  results and schema-hash mismatches are detected.
 - **Prompt assembly tests:** window slicing keeps provider-valid call/result
   pairing; prose/thinking stripped; collapse of a completed span; steer retention.
 - **Integration:** scripted session harness (as in pi-loop-antidote's
-  `extension.test.ts`) driving the shell end to end without a live model.
+  `extension.test.ts`) driving the shell end to end without a live model, including
+  headless UI guards, schema disappearance, safe tree/compaction spans, and
+  fail-closed mode-entry persistence.
 - **Long-horizon acceptance:** the bundled warehouse-style harness runs 50 accepted
   turns, asserts the projected message count and serialized footprint remain flat,
   and checks final ground truth. This deterministic test avoids paying for 50
   redundant live model turns.
 - **Live pi acceptance:** run the bundled skill through the real pi 0.84.2 CLI both
-  normally and with `--skill-state-constrained-sampling`; inspect persisted evidence
-  for mode entry, tagged patch, acceptance details, sole completion call, delayed
-  exit, and exact final state.
+  normally and with `--skill-state-constrained-sampling`; use
+  `scripts/verify-live-session.mjs` to check persisted evidence for mode entry,
+  tagged patch, acceptance details, sole completion call, delayed exit, and exact
+  final state.
 
 ---
 
@@ -467,9 +484,11 @@ enforces rather than requests wherever possible:
    RFC object patches are not closed under delete-then-rebuild composition. Sequence
    retention costs one tiny wrapper and makes identity/action/associativity true by
    construction.
-6. **Not composition-safe with other transcript-rewriting `context` extensions**
-   while an episode is Active. Documented rather than absorbed; no such extension is
-   currently installed on this machine.
+6. **Not composition-safe with other history or summary rewriters.** This includes
+   `context`, `session_before_compact`, and `session_before_tree` handlers that inspect
+   or replace the same history. The privacy guarantee requires skill-state to be the
+   sole handler in those categories; tool-level extensions that only trigger pi's
+   normal paths remain compatible.
 7. **Reasoning is dropped from context but kept on disk.** Session files grow as
    normal pi sessions do; the paper's storage frugality is not a goal here —
    auditability and branch replay are worth more in an interactive agent.

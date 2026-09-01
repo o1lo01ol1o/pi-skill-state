@@ -100,24 +100,30 @@ export function estimateStateTokens(state: State): number {
   return Math.ceil(renderState(state).length / 4);
 }
 
+export function parsePatch(schema: StateSchema, raw: unknown): Result<Patch> {
+  const shapeErrors = validationErrors(schema.patchSchema, raw, "patch", "schema-mismatch");
+  const parsed = isJsonObject(raw) && Array.isArray(raw.operations)
+    ? parseOperations(schema, raw.operations)
+    : undefined;
+  const semanticErrors = parsed && !parsed.ok ? parsed.errors : [];
+  const errors = [...shapeErrors, ...semanticErrors];
+  if (errors.length > 0) return { ok: false, errors };
+  if (!parsed?.ok) return err(patchError("schema-mismatch", "/", "tagged operation patch", raw));
+  return ok(asPatch(parsed.value));
+}
+
 export function acceptPatch(
   schema: StateSchema,
   current: State,
   raw: unknown,
   budget: PatchBudget,
 ): Result<AcceptedTransition> {
-  const shapeErrors = validationErrors(schema.patchSchema, raw, "patch", "schema-mismatch");
-  if (shapeErrors.length > 0) return { ok: false, errors: shapeErrors };
-  if (!isJsonObject(raw) || !Array.isArray(raw.operations)) {
-    return err(patchError("schema-mismatch", "/", "tagged operation patch", raw));
-  }
-
-  const parsed = parseOperations(schema, raw.operations);
+  const parsed = parsePatch(schema, raw);
   if (!parsed.ok) return parsed;
-  const next = runOperations(schema, current, parsed.value, budget);
+  const next = runOperations(schema, current, parsed.value.operations, budget);
   if (!next.ok) return next;
   return ok({
-    patch: asPatch(parsed.value),
+    patch: parsed.value,
     state: next.value.state,
     estimatedTokens: next.value.estimatedTokens,
   });
@@ -139,64 +145,86 @@ function parseOperations(schema: StateSchema, rawOperations: readonly unknown[])
 
   rawOperations.forEach((raw, index) => {
     const base = `/operations/${index}`;
-    if (!isJsonObject(raw)) {
-      errors.push(patchError("schema-mismatch", base, "operation object", raw));
-      return;
-    }
+    if (!isJsonObject(raw)) return;
     const path = raw.path;
     const action = raw.action;
     const encoded = raw.value;
-    if (typeof path !== "string" || typeof action !== "string" || typeof encoded !== "string") return;
+    const operationErrors: SkillStateError[] = [];
 
-    const resolved = resolveOperationPath(schema.root, path);
-    if (!resolved.ok) {
-      errors.push(...resolved.errors.map((error) => ({ ...error, path: `${base}/path` })));
-      return;
-    }
-    if (!isPatchAction(action)) return;
-    const allowed = allowedActions(resolved.value.node);
-    if (!allowed.includes(action)) {
-      const expected = allowed.length > 0
-        ? `${allowed.join(" or ")} for ${resolved.value.node.policy} field ${path}`
-        : `operations on protected descendant fields of ${path}`;
-      errors.push(
-        patchError(
-          "schema-mismatch",
-          `${base}/action`,
-          expected,
-          action,
-          resolved.value.node.policy,
-        ),
-      );
-      return;
+    const resolved = typeof path === "string" ? resolveOperationPath(schema.root, path) : undefined;
+    if (resolved && !resolved.ok) {
+      operationErrors.push(...resolved.errors.map((error) => ({ ...error, path: `${base}/path` })));
     }
 
-    let value: unknown;
-    try {
-      value = JSON.parse(encoded);
-    } catch (cause) {
-      errors.push(
-        patchError(
-          "schema-mismatch",
-          `${base}/value`,
-          "valid JSON payload string",
-          cause instanceof Error ? cause.message : cause,
-          resolved.value.node.policy,
-        ),
-      );
-      return;
-    }
-    if (!isJsonValue(value)) {
-      errors.push(patchError("schema-mismatch", `${base}/value`, "finite JSON value", value, resolved.value.node.policy));
-      return;
+    let actionCompatible = false;
+    if (resolved?.ok && typeof action === "string" && isPatchAction(action)) {
+      const allowed = allowedActions(resolved.value.node);
+      if (allowed.includes(action)) {
+        actionCompatible = true;
+      } else {
+        const expected = allowed.length > 0
+          ? `${allowed.join(" or ")} for ${resolved.value.node.policy} field ${path}`
+          : `operations on protected descendant fields of ${path}`;
+        operationErrors.push(
+          patchError(
+            "schema-mismatch",
+            `${base}/action`,
+            expected,
+            action,
+            resolved.value.node.policy,
+          ),
+        );
+      }
     }
 
-    const payloadErrors = validateOperationPayload(resolved.value.node, action, value, base);
-    if (payloadErrors.length > 0) {
-      errors.push(...payloadErrors);
+    let value: JsonValue | undefined;
+    let valueParsed = false;
+    if (typeof encoded === "string") {
+      try {
+        const decoded: unknown = JSON.parse(encoded);
+        if (isJsonValue(decoded)) {
+          value = decoded;
+          valueParsed = true;
+        } else {
+          operationErrors.push(
+            patchError(
+              "schema-mismatch",
+              `${base}/value`,
+              "finite JSON value",
+              decoded,
+              resolved?.ok ? resolved.value.node.policy : undefined,
+            ),
+          );
+        }
+      } catch (cause) {
+        operationErrors.push(
+          patchError(
+            "schema-mismatch",
+            `${base}/value`,
+            "valid JSON payload string",
+            cause instanceof Error ? cause.message : cause,
+            resolved?.ok ? resolved.value.node.policy : undefined,
+          ),
+        );
+      }
+    }
+
+    if (resolved?.ok && typeof action === "string" && isPatchAction(action) && actionCompatible && valueParsed) {
+      operationErrors.push(...validateOperationPayload(resolved.value.node, action, value!, base));
+    }
+    if (operationErrors.length > 0) {
+      errors.push(...operationErrors);
       return;
     }
-    operations.push({ path, action, value: canonicalizeJson(value) });
+    if (
+      resolved?.ok &&
+      typeof path === "string" &&
+      typeof action === "string" &&
+      isPatchAction(action) &&
+      valueParsed
+    ) {
+      operations.push({ path, action, value: canonicalizeJson(value!) });
+    }
   });
 
   return errors.length > 0 ? { ok: false, errors } : ok(operations);
@@ -224,11 +252,14 @@ function validateOperationPayload(
     case "union":
       if (!Array.isArray(value)) return [patchError("schema-mismatch", path, "JSON array delta", value, node.policy)];
       if (!node.items) return [patchError("schema-mismatch", path, "array item schema", value, node.policy)];
-      return value.flatMap((item, itemIndex) =>
-        Check(node.items!.raw, item)
-          ? []
-          : [patchError("schema-mismatch", `${path}/${itemIndex}`, "item matching the state schema", item, node.policy)],
-      );
+      return value.flatMap((item, itemIndex) => {
+        const itemPath = `${path}/${itemIndex}`;
+        return validationErrors(node.items!.raw, item, "patch", "schema-mismatch").map((error) => ({
+          ...error,
+          path: error.kind === "patch" && error.path !== "/" ? `${itemPath}${error.path}` : itemPath,
+          policy: node.policy,
+        }));
+      });
     case "sum":
       return typeof value === "number" && Number.isSafeInteger(value)
         ? []

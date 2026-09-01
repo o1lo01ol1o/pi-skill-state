@@ -18,6 +18,10 @@ test("B1 parses the bundled closed schema and derives defaults and patch policie
     shelves_done: [],
   });
   assert.equal(parsed.value.hash.length, 64);
+  const patchSchemaGolden = JSON.parse(
+    await readFile(new URL("./fixtures/patch-schema-v1.json", import.meta.url), "utf8"),
+  );
+  assert.deepEqual(parsed.value.patchSchema, patchSchemaGolden);
   assert.ok(Check(parsed.value.patchSchema, {
     operations: [
       { path: "/shelves_done", action: "union", value: '["7-01"]' },

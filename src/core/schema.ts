@@ -446,17 +446,36 @@ export function validationErrors(
   code: "invalid-default" | "schema-mismatch" | "closure",
 ): SkillStateError[] {
   if (Check(schema, value)) return [];
-  return ValueErrors(schema, value).map((issue) => {
-    const path = issue.instancePath || "/";
-    if (kind === "schema") return schemaError(code as "invalid-default", path, issue.message, valueAt(value, path));
-    return {
-      kind: "patch" as const,
-      code: code as "schema-mismatch" | "closure",
-      path,
-      expected: issue.message,
-      actual: valueAtDescription(value, path),
-    };
+  return ValueErrors(schema, value).flatMap((issue) => {
+    const paths = validationIssuePaths(issue);
+    return paths.map((path) => {
+      if (kind === "schema") return schemaError(code as "invalid-default", path, issue.message, valueAt(value, path));
+      return {
+        kind: "patch" as const,
+        code: code as "schema-mismatch" | "closure",
+        path,
+        expected: issue.message,
+        actual: valueAtDescription(value, path),
+      };
+    });
   });
+}
+
+function validationIssuePaths(issue: Readonly<{
+  keyword: string;
+  instancePath: string;
+  params: Readonly<Record<string, unknown>>;
+}>): string[] {
+  const base = issue.instancePath;
+  const names = issue.keyword === "required"
+    ? issue.params.requiredProperties
+    : issue.keyword === "additionalProperties"
+      ? issue.params.additionalProperties
+      : undefined;
+  if (Array.isArray(names) && names.every((name) => typeof name === "string")) {
+    return names.map((name) => pointer(base, name));
+  }
+  return [base || "/"];
 }
 
 function valueAt(value: unknown, pointerPath: string): unknown {

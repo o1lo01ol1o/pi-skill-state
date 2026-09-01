@@ -1,0 +1,44 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "operations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "RFC 6901 pointer to a state field"
+          },
+          "action": {
+            "type": "string",
+            "enum": [
+              "lww-set",
+              "lww-delete",
+              "append",
+              "union",
+              "sum",
+              "max",
+              "once"
+            ]
+          },
+          "value": {
+            "type": "string",
+            "description": "JSON-encoded operation payload; lww-delete requires null"
+          }
+        },
+        "required": [
+          "path",
+          "action",
+          "value"
+        ]
+      }
+    }
+  },
+  "required": [
+    "operations"
+  ]
+}

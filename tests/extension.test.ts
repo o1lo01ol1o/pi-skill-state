@@ -17,6 +17,8 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
   const statuses = new Map<string, string | undefined>();
   let activeTools = ["read", "bash"];
   let idle = true;
+  let failNextAppend = false;
+  let sessionFile = "/tmp/pi-skill-state-test-session.jsonl";
   let id = 0;
   let capturedCompactionPrompt = "";
 
@@ -47,20 +49,33 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
     },
     registerEntryRenderer() {},
     getCommands() {
-      return [{
-        name: "skill:warehouse-audit",
-        description: "test",
-        source: "skill",
-        sourceInfo: {
-          path: fileURLToPath(new URL("../skills/warehouse-audit/SKILL.md", import.meta.url)),
-          source: "test",
-          scope: "project",
-          origin: "top-level",
+      const sourceInfo = (path: string) => ({
+        path,
+        source: "test",
+        scope: "project",
+        origin: "top-level",
+      });
+      return [
+        {
+          name: "skill:warehouse-audit",
+          description: "test",
+          source: "skill",
+          sourceInfo: sourceInfo(fileURLToPath(new URL("../skills/warehouse-audit/SKILL.md", import.meta.url))),
         },
-      }];
+        {
+          name: "skill:broken",
+          description: "test",
+          source: "skill",
+          sourceInfo: sourceInfo(fileURLToPath(new URL("./fixtures/does-not-exist.md", import.meta.url))),
+        },
+      ];
     },
     appendEntry(customType: string, data: unknown) {
       append({ type: "custom", customType, data });
+      if (failNextAppend) {
+        failNextAppend = false;
+        throw new Error("simulated session persistence failure");
+      }
     },
     getActiveTools() {
       return [...activeTools];
@@ -87,6 +102,8 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
       },
     },
     sessionManager: {
+      getSessionFile: () => sessionFile,
+      getSessionId: () => "test-session",
       getLeafId: () => entries.at(-1)?.id ?? null,
       getBranch: () => [...entries],
       buildContextEntries: () => [...entries],
@@ -132,15 +149,20 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
 
   const input = await invoke("input", {
     type: "input",
-    text: "/skill:warehouse-audit aisle=7",
+    text: "/skill:warehouse-audit aisle=7  ",
     source: "interactive",
   }) as { action: string };
   assert.equal(input.action, "continue");
-  assert.ok(entries.some((entry) => entry.type === "custom" && entry.customType === MODE_ENTRY_TYPE));
+  const automaticEntry = entries.find(
+    (entry) => entry.type === "custom" && entry.customType === MODE_ENTRY_TYPE,
+  );
+  assert.equal(automaticEntry.data.procedure.args, "aisle=7  ");
   assert.ok(activeTools.includes("state_patch"));
   assert.ok(activeTools.includes("skill_complete"));
 
   append({ type: "message", message: { role: "user", content: "expanded skill invocation", timestamp: 2 } });
+  const commonSteerId = `common-${++id}`;
+  append({ id: commonSteerId, type: "message", message: { role: "user", content: "COMMON PREFIX SENTINEL", timestamp: 2.5 } });
   const before = await invoke("before_agent_start", {
     type: "before_agent_start",
     prompt: "expanded",
@@ -168,7 +190,21 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
   });
   const patchTool = tools.get("state_patch");
   assert.ok(patchTool);
+  assert.equal(patchTool.executionMode, "sequential");
+  assert.equal(typeof patchTool.promptSnippet, "string");
   assert.deepEqual(patchTool.prepareArguments(patchArgs), patchArgs);
+  assert.throws(
+    () => patchTool.prepareArguments({
+      operations: [
+        { path: "/items_counted", action: "sum" },
+        { path: "/items_counted", action: "append", value: "[]" },
+      ],
+    }),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message.includes("/operations/0/value") &&
+      error.message.includes("/operations/1/action"),
+  );
   const patchResult = await patchTool.execute("patch-1", patchArgs, undefined, undefined, context);
   append({
     type: "message",
@@ -214,6 +250,21 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
   assert.equal(capturedCompactionPrompt.includes("discard me"), false);
   assert.match(capturedCompactionPrompt, /skill-state-current/);
 
+  const scopedTree = await invoke("session_before_tree", {
+    type: "session_before_tree",
+    preparation: {
+      targetId: entries[0].id,
+      oldLeafId: entries.at(-1).id,
+      commonAncestorId: commonSteerId,
+      entriesToSummarize: entries.filter((entry) => entry.id !== commonSteerId && entry.id !== automaticEntry.id),
+      userWantsSummary: true,
+    },
+    signal: new AbortController().signal,
+  }) as { summary?: { summary: string } };
+  assert.equal(scopedTree.summary?.summary, "safe compact summary");
+  assert.equal(capturedCompactionPrompt.includes("COMMON PREFIX SENTINEL"), false);
+  assert.match(capturedCompactionPrompt, /skill-state-current/);
+
   append({
     type: "message",
     message: {
@@ -223,6 +274,8 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
     },
   });
   const completeTool = tools.get("skill_complete");
+  assert.equal(completeTool.executionMode, "sequential");
+  assert.equal(typeof completeTool.promptSnippet, "string");
   const completionResult = await completeTool.execute(
     "complete-1",
     { result: "aisle done" },
@@ -257,6 +310,22 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
   const enteredMarker = entries.find(
     (entry) => entry.type === "custom" && entry.data?.kind === "mode-entered",
   );
+  const completedTree = await invoke("session_before_tree", {
+    type: "session_before_tree",
+    preparation: {
+      targetId: enteredMarker.id,
+      oldLeafId: entries.at(-1).id,
+      commonAncestorId: enteredMarker.id,
+      entriesToSummarize: entries.filter((entry) =>
+        entry.type === "message" && entry.message?.role === "assistant"),
+      userWantsSummary: true,
+    },
+    signal: new AbortController().signal,
+  }) as { summary?: { summary: string } };
+  assert.equal(completedTree.summary?.summary, "safe compact summary");
+  assert.equal(capturedCompactionPrompt.includes("discard me"), false);
+  assert.match(capturedCompactionPrompt, /Final state/);
+
   const keepWholeEpisode = await invoke("session_before_compact", {
     type: "session_before_compact",
     preparation: { firstKeptEntryId: enteredMarker.id, tokensBefore: 250 },
@@ -269,6 +338,23 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
   assert.equal(capturedCompactionPrompt.includes("Final state"), false, "a wholly retained episode is not duplicated into the summary");
 
   append({ type: "message", message: { role: "user", content: "after episode", timestamp: 7 } });
+  const afterEpisodeId = entries.at(-1).id;
+  const insideEpisode = entries.find((entry) =>
+    entry.type === "message" &&
+    entry.message?.role === "assistant" &&
+    JSON.stringify(entry.message.content).includes("discard me"));
+  const adjusted = await invoke("session_before_compact", {
+    type: "session_before_compact",
+    preparation: { firstKeptEntryId: insideEpisode.id, tokensBefore: 400 },
+    branchEntries: [...entries],
+    reason: "manual",
+    willRetry: false,
+    signal: new AbortController().signal,
+  }) as { compaction?: { firstKeptEntryId: string } };
+  assert.equal(adjusted.compaction?.firstKeptEntryId, afterEpisodeId);
+  assert.equal(capturedCompactionPrompt.includes("discard me"), false);
+  assert.match(capturedCompactionPrompt, /Final state/);
+
   const collapsed = await invoke("context", { type: "context", messages: [] }) as { messages: any[] };
   assert.equal(JSON.stringify(collapsed.messages).includes("discard me"), false);
   assert.ok(collapsed.messages.some((message) => String(message.content).includes("Final state")));
@@ -287,6 +373,7 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
   assert.equal(capturedCompactionPrompt.includes("discard me"), false);
   assert.match(capturedCompactionPrompt, /Final state/);
 
+  flags.set("skill-state-constrained-sampling", true);
   await commands.get("skill-state").handler(
     "start warehouse-audit alpha  two   words  ",
     context,
@@ -295,7 +382,73 @@ test("shell runs an auto-armed episode end to end and delays exit until turn_end
     (entry) => entry.type === "custom" && entry.data?.kind === "mode-entered",
   );
   assert.equal(explicitEntry.data.procedure.args, "alpha  two   words  ");
+  assert.deepEqual(tools.get("state_patch").constrainedSampling, {
+    type: "json_schema",
+    strict: "require",
+  });
   await commands.get("skill-state").handler("stop", context);
+
+  const missingSchemaEntry = structuredClone(explicitEntry.data);
+  missingSchemaEntry.runId = "missing-schema-run";
+  missingSchemaEntry.enteredAt += 1;
+  missingSchemaEntry.procedure.schemaPath = fileURLToPath(
+    new URL("./fixtures/does-not-exist.schema.json", import.meta.url),
+  );
+  append({ type: "custom", customType: MODE_ENTRY_TYPE, data: missingSchemaEntry });
+  await invoke("session_tree", { type: "session_tree" });
+  await assert.rejects(
+    tools.get("state_patch").execute(
+      "missing-schema-patch",
+      { operations: [{ path: "/items_counted", action: "sum", value: "1" }] },
+      undefined,
+      undefined,
+      context,
+    ),
+    /schema-changed/,
+  );
+  await commands.get("skill-state").handler("stop", context);
+
+  const brokenInput = await invoke("input", {
+    type: "input",
+    text: "/skill:broken task",
+    source: "interactive",
+  }) as { action: string };
+  assert.equal(brokenInput.action, "handled");
+  assert.ok(notifications.some((item) => item.text.includes('"code":"boundary-io"')));
+
+  await commands.get("skill-state").handler("start warehouse-audit exit-persistence-test", context);
+  failNextAppend = true;
+  await commands.get("skill-state").handler("stop", context);
+  assert.equal(activeTools.includes("state_patch"), false);
+  const exitPersistenceBlocked = await invoke("tool_call", {
+    type: "tool_call",
+    toolCallId: "blocked-after-exit-persist-failure",
+    toolName: "bash",
+    input: { command: "echo unsafe" },
+  }) as { block?: boolean; reason?: string };
+  assert.equal(exitPersistenceBlocked.block, true);
+  assert.match(exitPersistenceBlocked.reason ?? "", /boundary-io/);
+
+  sessionFile = "/tmp/pi-skill-state-switched-session.jsonl";
+  await invoke("session_start", { type: "session_start", reason: "switch" });
+  failNextAppend = true;
+  await commands.get("skill-state").handler("start warehouse-audit entry-persistence-test", context);
+  assert.equal(activeTools.includes("state_patch"), false);
+  const entryPersistenceBlocked = await invoke("tool_call", {
+    type: "tool_call",
+    toolCallId: "blocked-after-entry-persist-failure",
+    toolName: "bash",
+    input: { command: "echo unsafe" },
+  }) as { block?: boolean; reason?: string };
+  assert.equal(entryPersistenceBlocked.block, true);
+  assert.match(entryPersistenceBlocked.reason ?? "", /boundary-io/);
+
+  context.mode = "print";
+  context.hasUI = false;
+  context.ui.notify = () => { throw new Error("notify called without UI"); };
+  context.ui.setStatus = () => { throw new Error("status called outside TUI"); };
+  await invoke("session_start", { type: "session_start", reason: "startup" });
+  await commands.get("skill-state").handler("status", context);
 
   append({
     type: "custom",

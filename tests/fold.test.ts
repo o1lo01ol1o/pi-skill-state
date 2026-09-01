@@ -32,6 +32,20 @@ function assistant(id: string, callId: string, args: unknown) {
   };
 }
 
+function assistantBatch(id: string, calls: readonly Readonly<{ id: string; args: unknown }>[]) {
+  return {
+    type: "message",
+    id,
+    parentId: null,
+    timestamp: "2023-01-01T00:00:01Z",
+    message: {
+      role: "assistant",
+      content: calls.map((call) => ({ type: "toolCall", id: call.id, name: "state_patch", arguments: call.args })),
+      timestamp: 1,
+    },
+  };
+}
+
 function result(id: string, callId: string, runId: string, schemaHash: string, estimatedTokens: number, isError = false) {
   return {
     type: "message",
@@ -95,6 +109,40 @@ test("failed state_patch results are excluded from replay", async () => {
     assert.equal(renderState(folded.value.active.state), '{"count":0}');
     assert.equal(folded.value.active.patches, 0);
   }
+});
+
+test("replay rejects out-of-order and duplicate state_patch results", async () => {
+  const { entered } = await fixtures();
+  const reversed = reconstructBranch([
+    custom("enter", entered),
+    assistantBatch("assistant", [
+      { id: "call-1", args: sumPatch(1) },
+      { id: "call-2", args: sumPatch(2) },
+    ]),
+    result("result-2", "call-2", entered.runId, entered.schemaHash, 3),
+    result("result-1", "call-1", entered.runId, entered.schemaHash, 3),
+  ]);
+  assert.equal(reversed.ok, false);
+  if (!reversed.ok) {
+    assert.ok(reversed.errors.some((error) => error.kind === "entry" && error.path === "/message/toolCallId"));
+  }
+
+  const duplicate = reconstructBranch([
+    custom("enter", entered),
+    assistant("assistant", "call-1", sumPatch(1)),
+    result("failed", "call-1", entered.runId, entered.schemaHash, 3, true),
+    result("duplicate", "call-1", entered.runId, entered.schemaHash, 3),
+  ]);
+  assert.equal(duplicate.ok, false);
+
+  const reusedCallId = reconstructBranch([
+    custom("enter", entered),
+    assistant("assistant-1", "call-1", sumPatch(1)),
+    result("result-1", "call-1", entered.runId, entered.schemaHash, 3),
+    assistant("assistant-2", "call-1", sumPatch(1)),
+    result("result-2", "call-1", entered.runId, entered.schemaHash, 3),
+  ]);
+  assert.equal(reusedCallId.ok, false);
 });
 
 test("branch prefixes reconstruct their own state", async () => {

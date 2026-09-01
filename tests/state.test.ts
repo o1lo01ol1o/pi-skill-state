@@ -131,6 +131,72 @@ test("path/action/payload mismatches accumulate at the tagged boundary", () => {
   }
 });
 
+test("outer-shape and sibling semantic errors accumulate with precise paths", () => {
+  const result = acceptPatch(
+    schema(),
+    initialState(schema()),
+    {
+      operations: [
+        { path: "/count", action: "sum" },
+        { path: "/count", action: "append", value: "[]" },
+      ],
+    },
+    UNBOUNDED,
+  );
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  const paths = result.errors.flatMap((error) => error.kind === "patch" ? [error.path] : []);
+  assert.deepEqual(paths, ["/operations/0/value", "/operations/1/action"]);
+});
+
+test("independent action and JSON payload errors accumulate within one operation", () => {
+  const result = acceptPatch(
+    schema(),
+    initialState(schema()),
+    { operations: [{ path: "/count", action: "append", value: "{" }] },
+    UNBOUNDED,
+  );
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  const paths = result.errors.flatMap((error) => error.kind === "patch" ? [error.path] : []);
+  assert.deepEqual(paths, ["/operations/0/action", "/operations/0/value"]);
+});
+
+test("append payload errors accumulate at precise nested paths", () => {
+  const parsed = parseStateSchema(JSON.stringify({
+    type: "object",
+    additionalProperties: false,
+    properties: {
+      defects: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: { shelf: { type: "string" }, issue: { type: "string" } },
+          required: ["shelf", "issue"],
+        },
+        default: [],
+        "x-skill-state": { merge: "append" },
+      },
+    },
+  }));
+  assert.equal(parsed.ok, true);
+  if (!parsed.ok) return;
+  const result = acceptPatch(
+    parsed.value,
+    initialState(parsed.value),
+    wire(["/defects", "append", [{ shelf: 1 }]]),
+    UNBOUNDED,
+  );
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  const paths = result.errors.flatMap((error) => error.kind === "patch" ? [error.path] : []).sort();
+  assert.deepEqual(paths, [
+    "/operations/0/value/0/issue",
+    "/operations/0/value/0/shelf",
+  ]);
+});
+
 test("lww ancestor operations cannot bypass protected descendant policies", () => {
   const protectedSchema = parseStateSchema(JSON.stringify({
     type: "object",

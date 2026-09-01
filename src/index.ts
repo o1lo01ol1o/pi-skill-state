@@ -19,10 +19,10 @@ import {
 import { Text } from "@earendil-works/pi-tui";
 import type { Static, TSchema } from "typebox";
 import { Type } from "typebox";
-import { Check } from "typebox/value";
 import {
   ACCEPTED_PATCH_KIND,
   MODE_ENTRY_TYPE,
+  acceptRuntimePatch,
   acceptedPatchDetails,
   reconstructBranch,
   type ActiveRuntime,
@@ -45,8 +45,8 @@ import {
   type ContextItem,
   type PromptMessage,
 } from "./core/prompt.js";
-import { parseStateSchema, validationErrors, type StateSchema } from "./core/schema.js";
-import { acceptPatch, estimateStateTokens, initialState, renderState } from "./core/state.js";
+import { parseStateSchema, type StateSchema } from "./core/schema.js";
+import { estimateStateTokens, initialState, parsePatch, renderState } from "./core/state.js";
 
 const STATUS_KEY = "skill-state";
 const STATE_PATCH_TOOL = "state_patch";
@@ -101,6 +101,7 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
   let pendingCompletion: PendingCompletion | undefined;
   let cachedLeaf: string | null | undefined;
   let cachedReconstruction: Reconstruction | undefined;
+  let persistenceBlock: Readonly<{ sessionKey: string; error: Error }> | undefined;
 
   const invalidate = (): void => {
     cachedLeaf = undefined;
@@ -108,6 +109,10 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
   };
 
   const reconstruct = (ctx: ExtensionContext): Reconstruction => {
+    if (persistenceBlock) {
+      if (persistenceBlock.sessionKey === sessionKey(ctx)) throw persistenceBlock.error;
+      persistenceBlock = undefined;
+    }
     const leaf = ctx.sessionManager.getLeafId();
     if (cachedLeaf === leaf && cachedReconstruction) return cachedReconstruction;
     const result = reconstructBranch(ctx.sessionManager.getBranch());
@@ -119,14 +124,11 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
 
   const updateStatus = (ctx: ExtensionContext, reconstruction: Reconstruction): void => {
     if (!reconstruction.active) {
-      ctx.ui.setStatus(STATUS_KEY, undefined);
+      setStatus(ctx, undefined);
       return;
     }
     const active = reconstruction.active;
-    ctx.ui.setStatus(
-      STATUS_KEY,
-      `Σ ${formatEstimate(active.state)} · t${active.turns} · p${active.patches}`,
-    );
+    setStatus(ctx, `Σ ${formatEstimate(active.state)} · t${active.turns} · p${active.patches}`);
   };
 
   const setEpisodeTools = (active: ActiveRuntime | undefined): void => {
@@ -149,6 +151,29 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
     return reconstruction;
   };
 
+  const appendModeEntry = (
+    ctx: ExtensionContext,
+    data: ModeEnteredV1 | ModeExitedV1,
+    operation: "enter" | "exit",
+  ): void => {
+    try {
+      pi.appendEntry(MODE_ENTRY_TYPE, data);
+    } catch (cause) {
+      const error = coreFailure([{
+        kind: "mode",
+        code: "boundary-io",
+        operation: `persist mode ${operation}`,
+        expected: "durable append-only session entry",
+        actual: cause instanceof Error ? cause.message : String(cause),
+      }]);
+      persistenceBlock = { sessionKey: sessionKey(ctx), error };
+      invalidate();
+      setEpisodeTools(undefined);
+      setStatus(ctx, "Σ blocked");
+      throw error;
+    }
+  };
+
   const appendExit = (
     ctx: ExtensionContext,
     active: ActiveRuntime,
@@ -165,7 +190,7 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
       finalState: renderState(active.state),
       exitedAt: Date.now(),
     };
-    pi.appendEntry(MODE_ENTRY_TYPE, exited);
+    appendModeEntry(ctx, exited, "exit");
     refresh(ctx);
   };
 
@@ -225,9 +250,9 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
       },
       config,
     };
-    pi.appendEntry(MODE_ENTRY_TYPE, entered);
+    appendModeEntry(ctx, entered, "enter");
     refresh(ctx);
-    ctx.ui.notify(`skill-state started: ${skillName}`, "info");
+    notify(ctx, `skill-state started: ${skillName}`, "info");
   };
 
   pi.registerTool({
@@ -238,21 +263,26 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
     parameters: CompleteParams,
     executionMode: "sequential",
     async execute(toolCallId, params, _signal, _onUpdate, ctx) {
-      const reconstruction = reconstruct(ctx);
-      if (!reconstruction.active) throw coreFailure([inactiveToolError(COMPLETE_TOOL)]);
-      requireOnlyCompletionCall(ctx, toolCallId);
-      pendingCompletion = {
-        toolCallId,
-        runId: reconstruction.active.mode.entered.runId,
-        result: params.result,
-        finalState: renderState(reconstruction.active.state),
-        schemaHash: reconstruction.active.schema.hash,
-      };
-      return {
-        content: [{ type: "text", text: `Episode complete: ${params.result}` }],
-        details: { v: 1, kind: "skill-state/completion", runId: pendingCompletion.runId },
-        terminate: true,
-      };
+      try {
+        const reconstruction = reconstruct(ctx);
+        if (!reconstruction.active) throw coreFailure([inactiveToolError(COMPLETE_TOOL)]);
+        requireOnlyCompletionCall(ctx, toolCallId);
+        pendingCompletion = {
+          toolCallId,
+          runId: reconstruction.active.mode.entered.runId,
+          result: params.result,
+          finalState: renderState(reconstruction.active.state),
+          schemaHash: reconstruction.active.schema.hash,
+        };
+        return {
+          content: [{ type: "text", text: `Episode complete: ${params.result}` }],
+          details: { v: 1, kind: "skill-state/completion", runId: pendingCompletion.runId },
+          terminate: true,
+        };
+      } catch (error) {
+        notifyFailure(ctx, error);
+        throw error;
+      }
     },
     renderCall(args, theme) {
       return new Text(
@@ -295,19 +325,20 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
           if (!reconstruction.active) throw coreFailure([inactiveToolError("stop")]);
           appendExit(ctx, reconstruction.active, "stopped", "Stopped by user.");
           pendingCompletion = undefined;
-          ctx.ui.notify("skill-state stopped", "info");
+          notify(ctx, "skill-state stopped", "info");
           return;
         }
         const reconstruction = reconstruct(ctx);
         if (action === "show") {
-          ctx.ui.notify(
+          notify(
+            ctx,
             reconstruction.active ? renderState(reconstruction.active.state) : "skill-state is inactive",
             "info",
           );
           return;
         }
         if (action === "status") {
-          ctx.ui.notify(formatDetailedStatus(reconstruction), "info");
+          notify(ctx, formatDetailedStatus(reconstruction), "info");
           return;
         }
         throw modeFailure(
@@ -341,7 +372,7 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
       refresh(ctx);
     } catch (error) {
       setEpisodeTools(undefined);
-      ctx.ui.setStatus(STATUS_KEY, "Σ blocked");
+      setStatus(ctx, "Σ blocked");
       notifyFailure(ctx, error);
     }
   });
@@ -351,11 +382,11 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
       refresh(ctx);
     } catch (error) {
       setEpisodeTools(undefined);
-      ctx.ui.setStatus(STATUS_KEY, "Σ blocked");
+      setStatus(ctx, "Σ blocked");
       notifyFailure(ctx, error);
     }
   });
-  pi.on("session_shutdown", (_event, ctx) => ctx.ui.setStatus(STATUS_KEY, undefined));
+  pi.on("session_shutdown", (_event, ctx) => setStatus(ctx, undefined));
 
   pi.on("before_agent_start", (event, ctx) => {
     try {
@@ -375,8 +406,8 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
       return { messages: assemblePrompt(timeline, reconstruction) as unknown as typeof event.messages };
     } catch (error) {
       const text = failureMessage(error);
-      ctx.ui.setStatus(STATUS_KEY, "Σ blocked");
-      ctx.ui.notify(text, "error");
+      setStatus(ctx, "Σ blocked");
+      notify(ctx, text, "error");
       return {
         messages: [{ role: "user", content: `Skill-state is blocked: ${text}`, timestamp: Date.now() }] as typeof event.messages,
       };
@@ -388,8 +419,8 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
       reconstruct(ctx);
     } catch (error) {
       const reason = `skill-state reconstruction is blocked: ${failureMessage(error)}`;
-      ctx.ui.setStatus(STATUS_KEY, "Σ blocked");
-      ctx.ui.notify(reason, "error");
+      setStatus(ctx, "Σ blocked");
+      notify(ctx, reason, "error");
       return { block: true, reason, terminate: true };
     }
   });
@@ -439,7 +470,7 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
 
     try {
       const safeMessages = assemblePrompt(
-        timelineFromEntries(ctx.sessionManager.buildContextEntries()),
+        timelineFromEntries(safeTreeEntries(event, branch, reconstructed.value)),
         reconstructed.value,
       );
       const summarized = await summarizeSafeMessages(
@@ -469,7 +500,7 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
       return { cancel: true };
     }
     if (reconstructed.value.active) {
-      ctx.ui.notify("Compaction cancelled while a skill-state episode is active.", "warning");
+      notify(ctx, "Compaction cancelled while a skill-state episode is active.", "warning");
       return { cancel: true };
     }
     if (reconstructed.value.completed.length === 0) return;
@@ -514,27 +545,26 @@ export default function skillStateExtension(pi: ExtensionAPI): void {
         : {}),
       executionMode: "sequential",
       prepareArguments(args) {
-        if (!Check(schema.patchSchema, args)) {
-          throw coreFailure(validationErrors(schema.patchSchema, args, "patch", "schema-mismatch"));
-        }
+        const parsed = parsePatch(schema, args);
+        if (!parsed.ok) throw coreFailure(parsed.errors);
         return args as Static<TSchema>;
       },
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        const reconstruction = reconstruct(ctx);
-        if (!reconstruction.active) throw coreFailure([inactiveToolError(STATE_PATCH_TOOL)]);
-        await verifySchemaHash(reconstruction.active);
-        const transition = acceptPatch(
-          reconstruction.active.schema,
-          reconstruction.active.state,
-          params,
-          { maxTokens: reconstruction.active.mode.entered.config.budgetTokens },
-        );
-        if (!transition.ok) throw coreFailure(transition.errors);
-        const details = acceptedPatchDetails(reconstruction.active, transition.value.estimatedTokens);
-        return {
-          content: [{ type: "text", text: `State accepted (${details.estimatedTokens} estimated tokens).` }],
-          details,
-        };
+        try {
+          const reconstruction = reconstruct(ctx);
+          if (!reconstruction.active) throw coreFailure([inactiveToolError(STATE_PATCH_TOOL)]);
+          await verifySchemaHash(reconstruction.active);
+          const transition = acceptRuntimePatch(reconstruction.active, params);
+          if (!transition.ok) throw coreFailure(transition.errors);
+          const details = acceptedPatchDetails(reconstruction.active, transition.value.estimatedTokens);
+          return {
+            content: [{ type: "text", text: `State accepted (${details.estimatedTokens} estimated tokens).` }],
+            details,
+          };
+        } catch (error) {
+          notifyFailure(ctx, error);
+          throw error;
+        }
       },
       renderCall(args, theme) {
         const count = isOperationArgs(args) ? args.operations.length : 0;
@@ -600,8 +630,28 @@ async function resolveSkill(
     throw modeFailure("skill-not-found", "resolve skill", "loaded skill command", skillName);
   }
   const skillPath = command.sourceInfo.path;
-  const source = await readFile(skillPath, "utf8");
-  const parsed = parseFrontmatter<SkillFrontmatter>(source);
+  let source: string;
+  try {
+    source = await readFile(skillPath, "utf8");
+  } catch (cause) {
+    throw modeFailure(
+      "boundary-io",
+      "read skill",
+      `readable skill file ${skillPath}`,
+      cause instanceof Error ? cause.message : String(cause),
+    );
+  }
+  let parsed: ReturnType<typeof parseFrontmatter<SkillFrontmatter>>;
+  try {
+    parsed = parseFrontmatter<SkillFrontmatter>(source);
+  } catch (cause) {
+    throw modeFailure(
+      "invalid-skill",
+      "parse skill",
+      `valid Agent Skill frontmatter in ${skillPath}`,
+      cause instanceof Error ? cause.message : String(cause),
+    );
+  }
   const metadata = parsed.frontmatter.metadata;
   if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
     if (!required) return undefined;
@@ -623,14 +673,24 @@ async function resolveSkill(
     );
   }
   const schemaPath = resolve(dirname(skillPath), relativeSchema);
-  const schemaBytes = await readFile(schemaPath, "utf8");
+  let schemaBytes: string;
+  try {
+    schemaBytes = await readFile(schemaPath, "utf8");
+  } catch (cause) {
+    throw modeFailure(
+      "boundary-io",
+      "read skill schema",
+      `readable schema file ${schemaPath}`,
+      cause instanceof Error ? cause.message : String(cause),
+    );
+  }
   const schema = parseStateSchema(schemaBytes);
   if (!schema.ok) throw coreFailure(schema.errors);
   return {
     name: skillName,
     skillPath,
     schemaPath,
-    skillBody: parsed.body.trim(),
+    skillBody: parsed.body,
     schemaBytes,
     schema: schema.value,
   };
@@ -670,7 +730,7 @@ function parseSkillInvocation(text: string): Readonly<{ name: string; args: stri
   const firstSpace = text.indexOf(" ");
   return firstSpace < 0
     ? { name: text.slice(7), args: "" }
-    : { name: text.slice(7, firstSpace), args: text.slice(firstSpace + 1).trim() };
+    : { name: text.slice(7, firstSpace), args: text.slice(firstSpace + 1) };
 }
 
 function takeLeadingToken(input: string): Readonly<{ token: string; rest: string }> | undefined {
@@ -714,6 +774,31 @@ function summaryTouchesEpisode(
   );
 }
 
+function safeTreeEntries(
+  event: SessionBeforeTreeEvent,
+  branch: readonly SessionEntry[],
+  reconstruction: Reconstruction,
+): SessionEntry[] {
+  const selected = new Set(event.preparation.entriesToSummarize.map((entry) => entry.id));
+  const positions = new Map(branch.map((entry, index) => [entry.id, index]));
+  const rangeTouchesSelection = (start: number, end: number): boolean =>
+    branch.some((entry, index) => index >= start && index <= end && selected.has(entry.id));
+
+  if (reconstruction.active) {
+    const entered = positions.get(reconstruction.active.mode.entryId);
+    if (entered !== undefined && rangeTouchesSelection(entered, branch.length - 1)) {
+      selected.add(reconstruction.active.mode.entryId);
+    }
+  }
+  for (const episode of reconstruction.completed) {
+    const entered = positions.get(episode.enteredEntryId);
+    const exited = positions.get(episode.exitedEntryId);
+    if (entered === undefined || exited === undefined || !rangeTouchesSelection(entered, exited)) continue;
+    for (let index = entered; index <= exited; index += 1) selected.add(branch[index]!.id);
+  }
+  return branch.filter((entry) => selected.has(entry.id));
+}
+
 async function createSafeCompaction(
   event: SessionBeforeCompactEvent,
   ctx: ExtensionContext,
@@ -721,19 +806,25 @@ async function createSafeCompaction(
 ) {
   const visible = buildContextEntries(event.branchEntries);
   let cutIndex = visible.findIndex((entry) => entry.id === event.preparation.firstKeptEntryId);
-  if (cutIndex < 0) throw new Error("Could not locate compaction cut point in the active branch");
-  let includeCutMarker = false;
-
+  if (cutIndex < 0) {
+    throw modeFailure(
+      "safe-summary",
+      "prepare compaction",
+      "compaction cut point on the active branch",
+      event.preparation.firstKeptEntryId,
+    );
+  }
   for (const episode of reconstruction.completed) {
     const entered = visible.findIndex((entry) => entry.id === episode.enteredEntryId);
     const exited = visible.findIndex((entry) => entry.id === episode.exitedEntryId);
     if (entered >= 0 && entered < cutIndex && exited >= cutIndex) {
-      cutIndex = exited;
-      includeCutMarker = true;
+      const afterEpisode = exited + 1;
+      if (afterEpisode >= visible.length) return undefined;
+      cutIndex = afterEpisode;
     }
   }
   const firstKeptEntryId = visible[cutIndex]!.id;
-  const summarizedEntries = visible.slice(0, cutIndex + (includeCutMarker ? 1 : 0));
+  const summarizedEntries = visible.slice(0, cutIndex);
   const safeMessages = assemblePrompt(timelineFromEntries(summarizedEntries), {
     mode: reconstruction.mode,
     completed: reconstruction.completed,
@@ -765,33 +856,57 @@ async function summarizeSafeMessages(
     convertToLlm(safeMessages as unknown as Parameters<typeof convertToLlm>[0]),
   );
   const model = ctx.model;
-  if (!model) throw new Error(`No active model is available for safe ${purpose}`);
+  if (!model) {
+    throw modeFailure(
+      "safe-summary",
+      `summarize ${purpose}`,
+      "active model for the safe projected view",
+      "no active model",
+    );
+  }
   const focus = customInstructions ? `\n\nAdditional focus: ${customInstructions}` : "";
-  const response = await ctx.modelRegistry.complete(
-    model,
-    {
-      messages: [{
-        role: "user",
-        content: [{
-          type: "text",
-          text: `Summarize the safe conversation view below for ${purpose}. Preserve goals, constraints, decisions, files changed, verification, blockers, and next steps. Do not invent or refer to hidden transcript content. The skill-state episode blocks are authoritative sufficient statistics.${focus}\n\n<conversation>\n${conversation}\n</conversation>`,
+  let response: Awaited<ReturnType<typeof ctx.modelRegistry.complete>>;
+  try {
+    response = await ctx.modelRegistry.complete(
+      model,
+      {
+        messages: [{
+          role: "user",
+          content: [{
+            type: "text",
+            text: `Summarize the safe conversation view below for ${purpose}. Preserve goals, constraints, decisions, files changed, verification, blockers, and next steps. Do not invent or refer to hidden transcript content. The skill-state episode blocks are authoritative sufficient statistics.${focus}\n\n<conversation>\n${conversation}\n</conversation>`,
+          }],
+          timestamp: Date.now(),
         }],
-        timestamp: Date.now(),
-      }],
-    },
-    {
-      maxTokens: Math.min(8192, model.maxTokens),
-      signal,
-      cacheRetention: "none",
-      sessionId: randomUUID(),
-    },
-  );
+      },
+      {
+        maxTokens: Math.min(8192, model.maxTokens),
+        signal,
+        cacheRetention: "none",
+        sessionId: randomUUID(),
+      },
+    );
+  } catch (cause) {
+    throw modeFailure(
+      "safe-summary",
+      `summarize ${purpose}`,
+      "successful model response over the safe projected view",
+      cause instanceof Error ? cause.message : String(cause),
+    );
+  }
   const summary = response.content
     .filter((part): part is { type: "text"; text: string } => part.type === "text")
     .map((part) => part.text)
     .join("\n")
     .trim();
-  if (!summary) throw new Error(`Safe ${purpose} model returned an empty summary`);
+  if (!summary) {
+    throw modeFailure(
+      "safe-summary",
+      `summarize ${purpose}`,
+      "non-empty summary of the safe projected view",
+      "model returned an empty summary",
+    );
+  }
   return { summary, usage: response.usage };
 }
 
@@ -849,8 +964,24 @@ function failureMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function sessionKey(ctx: ExtensionContext): string {
+  return ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId();
+}
+
 function notifyFailure(ctx: ExtensionContext, error: unknown): void {
-  ctx.ui.notify(failureMessage(error), "error");
+  notify(ctx, failureMessage(error), "error");
+}
+
+function notify(
+  ctx: ExtensionContext,
+  message: string,
+  level: "info" | "warning" | "error",
+): void {
+  if (ctx.hasUI) ctx.ui.notify(message, level);
+}
+
+function setStatus(ctx: ExtensionContext, value: string | undefined): void {
+  if (ctx.mode === "tui") ctx.ui.setStatus(STATUS_KEY, value);
 }
 
 function formatEstimate(state: ActiveRuntime["state"]): string {

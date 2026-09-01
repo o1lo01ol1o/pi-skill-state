@@ -44,43 +44,31 @@ export interface ModeExitedV1 {
 
 export type PersistedModeEntry = ModeEnteredV1 | ModeExitedV1;
 
+declare const modePhaseBrand: unique symbol;
+
 export interface InactiveMode {
   readonly tag: "inactive";
+  readonly [modePhaseBrand]: "inactive";
 }
 
 export interface ActiveMode {
   readonly tag: "active";
   readonly entryId: string;
   readonly entered: ModeEnteredV1;
+  readonly [modePhaseBrand]: "active";
 }
 
 export type ModeState = InactiveMode | ActiveMode;
 
-export const inactiveMode: InactiveMode = Object.freeze({ tag: "inactive" });
+export const inactiveMode = Object.freeze({ tag: "inactive" }) as InactiveMode;
 
-export function enterMode(current: ModeState, entryId: string, entered: ModeEnteredV1): Result<ActiveMode> {
-  if (current.tag === "active") {
-    return err({
-      kind: "mode",
-      code: "already-active",
-      operation: "start",
-      expected: "inactive mode",
-      actual: `run ${current.entered.runId} is already active`,
-    });
-  }
-  return ok({ tag: "active", entryId, entered });
+/** Protocol entry consumes the inactive phase; callers must parse raw transition order first. */
+export function enterMode(_current: InactiveMode, entryId: string, entered: ModeEnteredV1): ActiveMode {
+  return Object.freeze({ tag: "active", entryId, entered }) as ActiveMode;
 }
 
-export function exitMode(current: ModeState, exited: ModeExitedV1): Result<InactiveMode> {
-  if (current.tag === "inactive") {
-    return err({
-      kind: "mode",
-      code: "inactive",
-      operation: "stop",
-      expected: "active mode",
-      actual: `received exit for run ${exited.runId}`,
-    });
-  }
+/** Protocol exit consumes the active phase; an inactive caller is a type error. */
+export function exitMode(current: ActiveMode, exited: ModeExitedV1): Result<InactiveMode> {
   if (current.entered.runId !== exited.runId) {
     return err({
       kind: "entry",

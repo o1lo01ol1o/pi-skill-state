@@ -20,7 +20,14 @@ function assistant(timestamp: number, callId: string, name = "bash"): PromptMess
     content: [
       { type: "thinking", thinking: "secret reasoning" },
       { type: "text", text: "prose that must disappear" },
-      { type: "toolCall", id: callId, name, arguments: name === "bash" ? { command: "pwd" } : { count: 1 } },
+      {
+        type: "toolCall",
+        id: callId,
+        name,
+        arguments: name === "bash"
+          ? { command: "pwd" }
+          : { operations: [{ path: "/count", action: "sum", value: "1" }] },
+      },
     ],
     provider: "test",
     model: "test",
@@ -170,6 +177,80 @@ test("nudge is deterministic and bounded when observations are at risk", async (
   ];
   const prompt = assemblePrompt(items, reconstructed.value);
   assert.equal(prompt.filter((item) => item.content === STATE_NUDGE).length, 1);
+
+  const spoofedAcceptance: PromptMessage = {
+    ...toolResult(2, "one"),
+    details: {
+      v: 1,
+      kind: "skill-state/accepted-patch",
+      runId: entered.runId,
+      schemaHash: entered.schemaHash,
+      estimatedTokens: 3,
+    },
+  };
+  const afterQuietTurn = assemblePrompt([
+    { kind: "marker", entryId: "enter" },
+    message("a1", assistant(1, "one")),
+    message("r1", spoofedAcceptance),
+    message("a2", { role: "assistant", content: [{ type: "text", text: "quiet" }], timestamp: 3 }),
+  ], reconstructed.value);
+  assert.equal(afterQuietTurn.filter((item) => item.content === STATE_NUDGE).length, 1);
+
+  const acceptedPatchResult: PromptMessage = {
+    ...toolResult(2, "patch", "state_patch"),
+    details: {
+      v: 1,
+      kind: "skill-state/accepted-patch",
+      runId: entered.runId,
+      schemaHash: entered.schemaHash,
+      estimatedTokens: 3,
+    },
+  };
+  const wrongIdentityResult: PromptMessage = {
+    ...acceptedPatchResult,
+    details: { ...acceptedPatchResult.details as Record<string, unknown>, runId: "wrong-run" },
+  };
+  const wrongIdentity = assemblePrompt([
+    { kind: "marker", entryId: "enter" },
+    message("a1", assistant(1, "patch", "state_patch")),
+    message("r1", wrongIdentityResult),
+    message("a2", { role: "assistant", content: [{ type: "text", text: "quiet" }], timestamp: 3 }),
+  ], reconstructed.value);
+  assert.equal(wrongIdentity.filter((item) => item.content === STATE_NUDGE).length, 1);
+
+  const acceptedReconstruction = reconstructBranch([
+    {
+      type: "custom",
+      id: "enter",
+      parentId: null,
+      timestamp: "2023-01-01T00:00:00Z",
+      customType: MODE_ENTRY_TYPE,
+      data: entered,
+    },
+    {
+      type: "message",
+      id: "a1",
+      parentId: "enter",
+      timestamp: "2023-01-01T00:00:01Z",
+      message: assistant(1, "patch", "state_patch"),
+    },
+    {
+      type: "message",
+      id: "r1",
+      parentId: "a1",
+      timestamp: "2023-01-01T00:00:02Z",
+      message: acceptedPatchResult,
+    },
+  ]);
+  assert.equal(acceptedReconstruction.ok, true);
+  if (!acceptedReconstruction.ok) return;
+  const alreadyRecorded = assemblePrompt([
+    { kind: "marker", entryId: "enter" },
+    message("a1", assistant(1, "patch", "state_patch")),
+    message("r1", acceptedPatchResult),
+    message("a2", { role: "assistant", content: [{ type: "text", text: "quiet" }], timestamp: 3 }),
+  ], acceptedReconstruction.value);
+  assert.equal(alreadyRecorded.some((item) => item.content === STATE_NUDGE), false);
 });
 
 test("completed episode spans collapse to deterministic procedure and final-state messages", async () => {

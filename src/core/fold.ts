@@ -17,6 +17,7 @@ import {
   initialState,
   parseRenderedState,
   renderState,
+  type AcceptedTransition,
   type State,
 } from "./state.js";
 
@@ -44,6 +45,7 @@ export interface ActiveRuntime {
   readonly state: State;
   readonly turns: number;
   readonly patches: number;
+  readonly acceptedPatchCallIds: ReadonlySet<string>;
 }
 
 export interface Reconstruction {
@@ -59,6 +61,8 @@ export function reconstructBranch(entries: readonly unknown[]): Result<Reconstru
   let active: ActiveRuntime | undefined;
   const completed: CompletedEpisode[] = [];
   const calls = new Map<string, PendingCall>();
+  const seenCallIds = new Set<string>();
+  const pendingCallIds: string[] = [];
   const errors: SkillStateError[] = [];
 
   for (const rawEntry of entries) {
@@ -71,11 +75,17 @@ export function reconstructBranch(entries: readonly unknown[]): Result<Reconstru
         continue;
       }
       if (parsed.value.kind === "mode-entered") {
-        const transition = enterMode(mode, rawEntry.id, parsed.value);
-        if (!transition.ok) {
-          errors.push(...transition.errors);
+        if (mode.tag !== "inactive") {
+          errors.push({
+            kind: "mode",
+            code: "already-active",
+            operation: "start",
+            expected: "inactive mode",
+            actual: `run ${mode.entered.runId} is already active`,
+          });
           continue;
         }
+        const transition = enterMode(mode, rawEntry.id, parsed.value);
         const parsedSchema = parseStateSchema(parsed.value.procedure.schemaBytes);
         if (!parsedSchema.ok) {
           errors.push(...parsedSchema.errors);
@@ -98,19 +108,37 @@ export function reconstructBranch(entries: readonly unknown[]): Result<Reconstru
           );
           continue;
         }
-        mode = transition.value;
+        mode = transition;
         active = {
-          mode: transition.value,
+          mode: transition,
           schema: parsedSchema.value,
           state: initial,
           turns: 0,
           patches: 0,
+          acceptedPatchCallIds: new Set(),
         };
         calls.clear();
+        seenCallIds.clear();
+        pendingCallIds.length = 0;
       } else {
         if (!active || mode.tag !== "active") {
-          const transition = exitMode(mode, parsed.value);
-          if (!transition.ok) errors.push(...transition.errors);
+          errors.push({
+            kind: "mode",
+            code: "inactive",
+            operation: "stop",
+            expected: "active mode",
+            actual: `received exit for run ${parsed.value.runId}`,
+          });
+          continue;
+        }
+        if (pendingCallIds.length > 0) {
+          errors.push(
+            entryConsistency(
+              "/message/toolCallId",
+              "all state_patch calls resolved before mode exit",
+              pendingCallIds.join(", "),
+            ),
+          );
           continue;
         }
         const transition = exitMode(mode, parsed.value);
@@ -141,6 +169,8 @@ export function reconstructBranch(entries: readonly unknown[]): Result<Reconstru
         mode = transition.value;
         active = undefined;
         calls.clear();
+        seenCallIds.clear();
+        pendingCallIds.length = 0;
       }
       continue;
     }
@@ -157,35 +187,50 @@ export function reconstructBranch(entries: readonly unknown[]): Result<Reconstru
           continue;
         }
         if (!active) continue;
-        if (calls.has(part.id)) {
-          errors.push(entryConsistency("/message/content/id", "unique state_patch call id", part.id));
+        if (seenCallIds.has(part.id)) {
+          errors.push(entryConsistency("/message/content/id", "globally unique state_patch call id within the run", part.id));
           continue;
         }
+        seenCallIds.add(part.id);
         calls.set(part.id, {
           runId: active.mode.entered.runId,
           schemaHash: active.schema.hash,
           args: part.arguments,
         });
+        pendingCallIds.push(part.id);
       }
       continue;
     }
 
-    if (message.role !== "toolResult" || message.toolName !== "state_patch" || message.isError === true) continue;
+    if (message.role !== "toolResult" || message.toolName !== "state_patch") continue;
     if (typeof message.toolCallId !== "string") {
       errors.push(entryShape("/message/toolCallId", "state_patch tool call id", message.toolCallId));
       continue;
     }
+    const call = calls.get(message.toolCallId);
+    if (!call) {
+      errors.push(entryConsistency("/message/toolCallId", "one unresolved preceding state_patch call", message.toolCallId));
+      continue;
+    }
+    const expectedCallId = pendingCallIds[0];
+    if (message.toolCallId !== expectedCallId) {
+      errors.push(
+        entryConsistency(
+          "/message/toolCallId",
+          `next state_patch result for emitted call ${expectedCallId}`,
+          message.toolCallId,
+        ),
+      );
+      continue;
+    }
+    calls.delete(message.toolCallId);
+    pendingCallIds.shift();
+    if (message.isError === true) continue;
     const details = parseAcceptedPatchDetails(message.details);
     if (!details.ok) {
       errors.push(...details.errors);
       continue;
     }
-    const call = calls.get(message.toolCallId);
-    if (!call) {
-      errors.push(entryConsistency("/message/toolCallId", "preceding state_patch call", message.toolCallId));
-      continue;
-    }
-    calls.delete(message.toolCallId);
     if (!active || mode.tag !== "active") {
       errors.push({
         kind: "mode",
@@ -204,12 +249,7 @@ export function reconstructBranch(entries: readonly unknown[]): Result<Reconstru
       errors.push(entryConsistency("/details/schemaHash", active.schema.hash, details.value.schemaHash));
       continue;
     }
-    const transition = acceptPatch(
-      active.schema,
-      active.state,
-      call.args,
-      { maxTokens: active.mode.entered.config.budgetTokens },
-    );
+    const transition = acceptRuntimePatch(active, call.args);
     if (!transition.ok) {
       errors.push(...transition.errors);
       continue;
@@ -228,6 +268,7 @@ export function reconstructBranch(entries: readonly unknown[]): Result<Reconstru
       ...active,
       state: transition.value.state,
       patches: active.patches + 1,
+      acceptedPatchCallIds: new Set([...active.acceptedPatchCallIds, message.toolCallId]),
     };
   }
 
@@ -237,6 +278,16 @@ export function reconstructBranch(entries: readonly unknown[]): Result<Reconstru
     ...(active ? { active } : {}),
     completed,
   });
+}
+
+/** The protocol patch transition requires an active runtime witness. */
+export function acceptRuntimePatch(runtime: ActiveRuntime, raw: unknown): Result<AcceptedTransition> {
+  return acceptPatch(
+    runtime.schema,
+    runtime.state,
+    raw,
+    { maxTokens: runtime.mode.entered.config.budgetTokens },
+  );
 }
 
 export function acceptedPatchDetails(runtime: ActiveRuntime, estimatedTokens: number): AcceptedPatchDetailsV1 {

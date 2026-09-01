@@ -23,6 +23,9 @@ export type ModeErrorCode =
   | "already-active"
   | "skill-not-found"
   | "skill-not-stateful"
+  | "invalid-skill"
+  | "boundary-io"
+  | "safe-summary"
   | "invalid-command"
   | "reconstruction";
 
