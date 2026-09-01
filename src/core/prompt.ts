@@ -85,11 +85,35 @@ function assembleActive(items: readonly ContextItem[], active: ActiveRuntime): P
     for (const call of calls) selectedCallIds.add(call.id);
   }
 
+  // Extension-injected custom messages (and context-visible `!` bash runs) are
+  // observations: kept while inside the window span, deferred past any
+  // call/result pair they would otherwise split, expired with the window.
+  const evictedCount = assistantIndices.length - selectedAssistantIndices.length;
+  const windowStartIndex = evictedCount > 0 ? assistantIndices[evictedCount - 1]! : -1;
+
   const windowMessages: PromptMessage[] = [];
+  const openResultIds = new Set<string>();
+  const deferredObservations: PromptMessage[] = [];
+  const flushObservations = (): void => {
+    if (openResultIds.size === 0 && deferredObservations.length > 0) {
+      windowMessages.push(...deferredObservations);
+      deferredObservations.length = 0;
+    }
+  };
   messages.forEach(({ message }, index) => {
     const calls = completeAssistantCalls.get(index);
     if (calls) {
       windowMessages.push({ ...message, content: calls.map((call) => call.raw) });
+      for (const call of calls) openResultIds.add(call.id);
+      return;
+    }
+    if (
+      (message.role === "custom" || message.role === "bashExecution") &&
+      message.excludeFromContext !== true &&
+      index > windowStartIndex
+    ) {
+      deferredObservations.push(message);
+      flushObservations();
       return;
     }
     if (
@@ -98,8 +122,11 @@ function assembleActive(items: readonly ContextItem[], active: ActiveRuntime): P
       selectedCallIds.has(message.toolCallId)
     ) {
       windowMessages.push(message);
+      openResultIds.delete(message.toolCallId);
+      flushObservations();
     }
   });
+  flushObservations();
 
   const prompt: PromptMessage[] = [
     syntheticUser(renderStateView(active), active.mode.entered.enteredAt + 1),

@@ -166,6 +166,66 @@ test("branch prefixes reconstruct their own state", async () => {
   }
 });
 
+test("never-resolved proposals from aborted turns expire instead of blocking replay", async () => {
+  const { entered } = await fixtures();
+  const user = (id: string, timestamp: number) => ({
+    type: "message",
+    id,
+    parentId: null,
+    timestamp: "2023-01-01T00:00:03Z",
+    message: { role: "user", content: "continue", timestamp },
+  });
+
+  const abortedBatch = reconstructBranch([
+    custom("enter", entered),
+    assistantBatch("assistant-1", [
+      { id: "call-1", args: sumPatch(5) },
+      { id: "call-2", args: sumPatch(7) },
+    ]),
+    result("result-1", "call-1", entered.runId, entered.schemaHash, 3, true),
+    user("steer", 3),
+    assistant("assistant-2", "call-3", sumPatch(2)),
+    result("result-3", "call-3", entered.runId, entered.schemaHash, 3),
+  ]);
+  assert.equal(abortedBatch.ok, true, abortedBatch.ok ? undefined : JSON.stringify(abortedBatch.errors));
+  if (abortedBatch.ok && abortedBatch.value.active) {
+    assert.equal(renderState(abortedBatch.value.active.state), '{"count":2}');
+    assert.equal(abortedBatch.value.active.patches, 1);
+  }
+
+  const danglingAcrossTurn = reconstructBranch([
+    custom("enter", entered),
+    assistant("assistant-1", "call-1", sumPatch(5)),
+    assistant("assistant-2", "call-2", sumPatch(2)),
+    result("result-2", "call-2", entered.runId, entered.schemaHash, 3),
+  ]);
+  assert.equal(danglingAcrossTurn.ok, true);
+  if (danglingAcrossTurn.ok && danglingAcrossTurn.value.active) {
+    assert.equal(renderState(danglingAcrossTurn.value.active.state), '{"count":2}');
+  }
+});
+
+test("mode exit expires dangling proposals and still cross-checks final state", async () => {
+  const { entered, exited } = await fixtures();
+  const stopAfterAbort = reconstructBranch([
+    custom("enter", entered),
+    assistant("assistant", "call-1", sumPatch(5)),
+    custom("exit", { ...exited, finalState: '{"count":0}' }),
+  ]);
+  assert.equal(stopAfterAbort.ok, true, stopAfterAbort.ok ? undefined : JSON.stringify(stopAfterAbort.errors));
+  if (stopAfterAbort.ok) {
+    assert.equal(stopAfterAbort.value.mode.tag, "inactive");
+    assert.equal(stopAfterAbort.value.completed.length, 1);
+  }
+
+  const wrongFinal = reconstructBranch([
+    custom("enter", entered),
+    assistant("assistant", "call-1", sumPatch(5)),
+    custom("exit", { ...exited, finalState: '{"count":5}' }),
+  ]);
+  assert.equal(wrongFinal.ok, false, "an expired proposal must not count toward final state");
+});
+
 test("replay rejects a persisted run whose initial defaults exceed its frozen budget", async () => {
   const { entered } = await fixtures();
   const folded = reconstructBranch([

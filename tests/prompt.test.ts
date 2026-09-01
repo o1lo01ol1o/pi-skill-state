@@ -261,6 +261,57 @@ test("nudge is deterministic and bounded when observations are at risk", async (
   assert.equal(alreadyRecorded.some((item) => item.content === STATE_NUDGE), false);
 });
 
+test("custom messages ride the observation window without splitting call/result pairs", async () => {
+  const entered = { ...(await enteredFixture()), source: "command", config: {
+    windowTurns: 1,
+    budgetTokens: 4000,
+    constrainedSampling: false,
+  } };
+  const reconstructed = reconstructBranch([{
+    type: "custom",
+    id: "enter",
+    parentId: null,
+    timestamp: "2023-01-01T00:00:00Z",
+    customType: MODE_ENTRY_TYPE,
+    data: entered,
+  }]);
+  assert.equal(reconstructed.ok, true);
+  if (!reconstructed.ok) return;
+
+  const customMessage = (id: string, text: string, timestamp: number): ContextItem =>
+    message(id, {
+      role: "custom",
+      customType: "subagent-notify",
+      content: [{ type: "text", text }],
+      display: true,
+      timestamp,
+    });
+
+  const prompt = assemblePrompt([
+    { kind: "marker", entryId: "enter" },
+    customMessage("c-evicted", "stale notify", 1),
+    message("a1", assistant(2, "old")),
+    message("r1", toolResult(3, "old")),
+    customMessage("c-between", "child one done", 4),
+    message("a2", assistant(5, "recent")),
+    customMessage("c-mid-pair", "child two done", 6),
+    message("r2", toolResult(7, "recent")),
+  ], reconstructed.value);
+
+  const rendered = JSON.stringify(prompt);
+  assert.equal(rendered.includes("stale notify"), false, "customs older than the window are evicted");
+  assert.ok(rendered.includes("child one done"));
+  assert.ok(rendered.includes("child two done"));
+
+  const order = prompt.flatMap((item) => {
+    if (item.role === "custom") return [String((item.content as Array<{ text: string }>)[0]!.text)];
+    if (item.role === "assistant") return ["assistant"];
+    if (item.role === "toolResult") return ["result"];
+    return [];
+  });
+  assert.deepEqual(order, ["child one done", "assistant", "result", "child two done"]);
+});
+
 test("completed episode spans collapse to deterministic procedure and final-state messages", async () => {
   const entered = await enteredFixture();
   const exited = JSON.parse(await readFile(new URL("./fixtures/mode-exited-v1.json", import.meta.url), "utf8"));

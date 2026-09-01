@@ -1,11 +1,48 @@
 # pi-skill-state
 
-A pi extension for bounded, schema-validated state during long procedural skill runs.
-It keeps the append-only session log for audit while replacing model context with:
+A [pi](https://github.com/badlogic/pi-mono) extension implementing the runtime
+of **SKILL.state: Scalable Long-Horizon Agent Skills** (Badhe, Tiwari & Chung,
+[arXiv:2608.26263](https://arxiv.org/abs/2608.26263), 2026) — bounded,
+schema-validated execution state for long procedural skill runs.
 
-```text
-(procedure, current checked state, bounded recent observations)
-```
+## Motivation and approach
+
+Append-only transcripts scale badly on long procedural tasks: every turn
+re-sends the whole history, so cumulative tokens grow O(T²) with horizon, the
+context window eventually overflows, and models degrade well before it does —
+the paper measures open-weight models falling to 0.34–0.42 task accuracy by
+turn 100 under transcript prompting, and budget-matched compression baselines
+(sliding-window truncation, entropy-based pruning) collapsing to 0.18–0.22
+because they evict facts that were still load-bearing.
+
+SKILL.state's alternative: during a procedural episode, replace the transcript
+with a bounded prompt **A_t = (P, Σ_t, O_t)** — an immutable procedure **P**,
+an explicit, schema-validated, mutable execution state **Σ**, and a bounded
+window of recent observations **O**. The model updates Σ through validated
+patches (**Σ_{t+1} = Σ_t ⊕ ΔΣ_t**); its chain-of-thought is intact while it
+works but is permanently discarded from later prompts. Prompt size becomes
+O(1) in horizon and cumulative tokens O(T); at the same ~1.8k-token budget
+where the compression baselines score ≤0.22, structured state scores 0.94.
+
+This extension maps that architecture onto pi:
+
+- pi's `context` event supplies the bounded view per turn **without touching
+  session persistence** — the append-only session log keeps full fidelity
+  (reasoning included) for audit and branching, which the paper's runtime
+  gives up.
+- P is a normal pi skill plus its invocation arguments, frozen at episode
+  start; ΔΣ travels as a `state_patch` tool call; Σ is a pure fold of accepted
+  patches along the active session branch.
+- The paper's ⊕ (last-writer-wins with null deletion) is refined by per-field
+  **merge policies** (`append`, `union`, `sum`, `max`, `once`; default `lww`)
+  declared in the schema. The paper's own error analysis attributes 68% of
+  open-model state failures to premature overwrites/deletions — policy fields
+  make those structurally unrepresentable rather than merely discouraged.
+- Completed episodes collapse deterministically to (procedure header, final
+  state, result) in all later context — no summarizer model involved.
+
+See [`SPEC.md`](SPEC.md) for the full design, its laws, and every stated
+trade-off.
 
 ## Use
 
@@ -99,9 +136,10 @@ Interaction boundaries, verified against `pi-subagents` 0.56:
   window, and the model should fold what it needs into state before the window
   slides. Recommended pattern: the parent owns the episode; children do
   stateless legwork.
-- **Async completions are invisible mid-episode** (see Known issues): async
-  results arrive as custom messages, which the bounded view currently drops.
-  Use foreground delegation while an episode is active.
+- **Async completions ride the observation window.** Async results arrive as
+  custom messages and are visible while within the k-turn window; like any
+  observation they expire when the window slides, so the model must record
+  what it needs into state promptly on arrival.
 - **Don't hand stateful skills to subagents.** Arming happens on user
   `/skill:name` input or `/skill-state start`; children receive their task as a
   prompt (never a slash input) and are often spawned with `--no-extensions`, so
@@ -149,19 +187,6 @@ with: the provider and model, the session JSONL (or a redacted excerpt), and the
 per-turn usage numbers (input / cache-read / cache-write). The same goes for any
 cache invalidation you can attribute to this extension where the design above
 says there shouldn't be one.
-
-## Known issues
-
-- Aborting mid-turn (Esc) while an assistant message still has unexecuted
-  `state_patch` calls can leave a dangling proposal that wedges branch
-  reconstruction ("Skill-state is blocked"). Workaround: `/tree`-navigate above
-  the aborted message. A fold-level fix (expiring never-resolved proposals) is
-  planned; PRs welcome.
-- While an episode is active, custom messages injected by other extensions —
-  e.g. pi-subagents' async `subagent-notify` completions — are outside the
-  bounded view and never reach the model. Planned fix: include custom messages
-  in the observation window. Until then, prefer foreground delegation during
-  episodes; PRs welcome.
 
 ## Requirements
 

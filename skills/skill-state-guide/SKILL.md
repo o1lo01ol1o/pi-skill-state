@@ -228,9 +228,10 @@ is in play:
 1. **Delegate stateless legwork via foreground (synchronous) calls only.** The
    call and its result land in the observation window like any other action —
    fold what you need into state in the same turn.
-2. **Do not use async delegation mid-episode.** Async completions arrive as
-   custom messages, which the bounded view drops — the result will never reach
-   you while the episode is active.
+2. **Record async results the moment they arrive.** Async completions arrive
+   as custom messages that ride the observation window like any observation —
+   they expire when the window slides, so fold what you need into state in the
+   same turn you see them.
 3. **Never instruct a subagent to run a stateful skill.** Children cannot arm
    the runtime (arming requires user `/skill:name` input or `/skill-state
    start` in that session, and children often run without extensions), so the

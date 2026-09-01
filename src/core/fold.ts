@@ -65,6 +65,14 @@ export function reconstructBranch(entries: readonly unknown[]): Result<Reconstru
   const pendingCallIds: string[] = [];
   const errors: SkillStateError[] = [];
 
+  // A proposal whose turn ended without a result (abort) was never executed:
+  // acceptance facts come only from persisted results. Custom messages can land
+  // mid-batch, so expiry triggers only on user/assistant messages and mode exit.
+  const expirePending = (): void => {
+    for (const callId of pendingCallIds) calls.delete(callId);
+    pendingCallIds.length = 0;
+  };
+
   for (const rawEntry of entries) {
     if (!isEntry(rawEntry)) continue;
 
@@ -131,16 +139,7 @@ export function reconstructBranch(entries: readonly unknown[]): Result<Reconstru
           });
           continue;
         }
-        if (pendingCallIds.length > 0) {
-          errors.push(
-            entryConsistency(
-              "/message/toolCallId",
-              "all state_patch calls resolved before mode exit",
-              pendingCallIds.join(", "),
-            ),
-          );
-          continue;
-        }
+        expirePending();
         const transition = exitMode(mode, parsed.value);
         if (!transition.ok) {
           errors.push(...transition.errors);
@@ -178,7 +177,13 @@ export function reconstructBranch(entries: readonly unknown[]): Result<Reconstru
     if (rawEntry.type !== "message" || !isJsonObject(rawEntry.message)) continue;
     const message = rawEntry.message;
 
+    if (message.role === "user") {
+      expirePending();
+      continue;
+    }
+
     if (message.role === "assistant" && Array.isArray(message.content)) {
+      expirePending();
       if (active) active = { ...active, turns: active.turns + 1 };
       for (const part of message.content) {
         if (!isJsonObject(part) || part.type !== "toolCall" || part.name !== "state_patch") continue;

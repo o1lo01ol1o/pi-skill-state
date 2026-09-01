@@ -224,7 +224,11 @@ copy it receives plus the folded Σ (pure function; no hidden state):
 4. The observation window: the last **k** turns' assistant messages with prose and
    thinking blocks **stripped** but tool-call blocks retained, each followed by its
    tool results — retaining a_t and O_t while discarding R_t, and keeping
-   call/result pairing valid for every provider.
+   call/result pairing valid for every provider. Extension-injected custom
+   messages (e.g. async subagent completions) and context-visible `!` bash runs
+   that fall within the window span are retained as observations in original
+   order, deferred past any call/result pair they would otherwise split; like
+   every observation they expire when the window slides.
 
 Anything older than the window and not folded into Σ is absent. That absence is the
 paper's forcing function and is stated plainly in the runtime contract.
@@ -234,7 +238,13 @@ more tagged operations; calls in one assistant message apply in emission order.
 Successful result details attest version, run, schema hash, and state token estimate;
 the fold replays only matching non-error results and their recorded call arguments.
 Persisted results must occur in proposal-emission order; duplicate or out-of-order
-results are malformed B3 input and block reconstruction.
+results are malformed B3 input and block reconstruction. A proposal whose turn ends
+without a result (abort mid-batch or mid-stream) was never executed — acceptance
+facts come only from persisted results — so the fold **expires** it at the next user
+or assistant message or at mode exit rather than treating it as corruption. Custom
+messages do not trigger expiry (they can land mid-batch). The denormalized final
+state in `mode-exited` remains the cross-check: an expired proposal that somehow
+influenced recorded state fails reconstruction loudly.
 
 **Nudge:** if a turn ends with tool executions but no accepted `state_patch`, and the
 next turn's window would evict unrecorded observations, the context handler injects a
@@ -353,10 +363,10 @@ metadata:
   writes into a parent's state (multi-writer merge is §15 future work).
   Interaction facts, verified against pi-subagents 0.56: foreground delegation
   from inside an episode behaves as an ordinary action/observation pair in the
-  window; async completions are delivered as *custom* messages, which the
-  bounded view currently excludes — a documented limitation (candidate fix:
-  include custom messages in the observation window; tracked in README Known
-  issues). Children cannot arm stateful skills — arming requires user
+  window; async completions are delivered as *custom* messages, which ride the
+  observation window as observations (§5) — the model must fold what it needs
+  into Σ before the window slides, like any observation. Children cannot arm
+  stateful skills — arming requires user
   `/skill:name` input or `/skill-state start` in that session, and children
   may be spawned `--no-extensions` — so stateful skills degrade to plain
   instructions there. Fork-context children forked mid-episode continue a
@@ -379,6 +389,7 @@ Mapping the paper's measured error taxonomy (its Experiment 7) to this design:
 | JSON formatting (12%) | Outer operation structure uses native tool arguments and optional constrained sampling; malformed inner JSON payload text is rejected precisely at `/operations/i/value` |
 | Model forgets to record before window slides | Deterministic nudge (§5); window k ≥ 1 gives one turn of grace |
 | Model never calls `skill_complete` | Runtime contract instruction + `/skill-state stop` escape hatch; status surface shows the episode is still open |
+| User aborts mid-turn, leaving unexecuted `state_patch` proposals | Fold expires never-resolved proposals at the next turn boundary or mode exit (§5); the denormalized final state cross-checks replay |
 
 ---
 
