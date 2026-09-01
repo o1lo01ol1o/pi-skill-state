@@ -219,6 +219,26 @@ transcript, including discarded reasoning, remains in the session file, and
 `/tree` branching into the middle of an episode reconstructs Σ exactly as it
 was at that point.
 
+## Delegating to subagents during an episode
+
+State is single-writer and belongs to the session that armed it; subagents
+never write into it. Four rules when a subagents extension (e.g. pi-subagents)
+is in play:
+
+1. **Delegate stateless legwork via foreground (synchronous) calls only.** The
+   call and its result land in the observation window like any other action —
+   fold what you need into state in the same turn.
+2. **Do not use async delegation mid-episode.** Async completions arrive as
+   custom messages, which the bounded view drops — the result will never reach
+   you while the episode is active.
+3. **Never instruct a subagent to run a stateful skill.** Children cannot arm
+   the runtime (arming requires user `/skill:name` input or `/skill-state
+   start` in that session, and children often run without extensions), so the
+   skill degrades to plain instructions referencing tools that do not exist.
+4. **Do not fork a child from mid-episode.** It either continues a divergent
+   episode that never merges back or sees the raw span; use fresh-context
+   children while an episode is active.
+
 ## Debugging rejections
 
 Errors name the operation index, expected form, and found value; typical ones:

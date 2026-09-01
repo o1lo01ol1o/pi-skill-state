@@ -349,7 +349,22 @@ metadata:
   sees. No coupling.
 - **Modes:** works in TUI, `--print`, and RPC modes (no TUI-only dependencies in the
   core path; UI surface is guarded by `ctx.hasUI` / `mode === "tui"`).
-- **Subagents:** out of scope for v1 (§15).
+- **Subagents:** Σ is single-writer and session/branch-local; no child thread
+  writes into a parent's state (multi-writer merge is §15 future work).
+  Interaction facts, verified against pi-subagents 0.56: foreground delegation
+  from inside an episode behaves as an ordinary action/observation pair in the
+  window; async completions are delivered as *custom* messages, which the
+  bounded view currently excludes — a documented limitation (candidate fix:
+  include custom messages in the observation window; tracked in README Known
+  issues). Children cannot arm stateful skills — arming requires user
+  `/skill:name` input or `/skill-state start` in that session, and children
+  may be spawned `--no-extensions` — so stateful skills degrade to plain
+  instructions there. Fork-context children forked mid-episode continue a
+  divergent episode (if they load this extension) and additionally pair this
+  extension's context rewrite with pi-subagents' child-side rewriter — the
+  composition conflict above; fresh-context children avoid both. pi-subagents'
+  parent-side hooks do not rewrite history or produce compactions and remain
+  compatible.
 
 ---
 

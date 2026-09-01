@@ -87,6 +87,35 @@ rewriter could observe raw episode entries or replace the safe projection. Exten
 that merely request pi's normal compaction remain compatible because skill-state
 still owns the resulting event.
 
+## Subagents
+
+Skill-state is single-writer by design: an episode's state belongs to the
+session (and branch) that armed it, and nothing a subagent does writes into the
+parent's state. Multi-writer merge is future work ([`SPEC.md`](SPEC.md) §15).
+Interaction boundaries, verified against `pi-subagents` 0.56:
+
+- **Foreground delegation works.** A synchronous subagent call from inside an
+  episode is an ordinary action: the call and its result ride the observation
+  window, and the model should fold what it needs into state before the window
+  slides. Recommended pattern: the parent owns the episode; children do
+  stateless legwork.
+- **Async completions are invisible mid-episode** (see Known issues): async
+  results arrive as custom messages, which the bounded view currently drops.
+  Use foreground delegation while an episode is active.
+- **Don't hand stateful skills to subagents.** Arming happens on user
+  `/skill:name` input or `/skill-state start`; children receive their task as a
+  prompt (never a slash input) and are often spawned with `--no-extensions`, so
+  a stateful skill degrades to plain instructions referencing `state_patch` /
+  `skill_complete` tools that don't exist in the child.
+- **Avoid fork-context children while an episode is active.** A child forked
+  mid-episode either continues a divergent episode that never merges back (if
+  it loads this extension) or sees the raw episode span (if it doesn't) — and
+  pi-subagents installs its own child-side context rewriter, which is exactly
+  the composition-unsafe pairing described under Compatibility boundary.
+  Prefer `fresh` context for children spawned during episodes.
+- Parent-side composition with pi-subagents is safe: it does not rewrite the
+  parent's context and never produces its own compaction summaries.
+
 ## Performance and prompt caching: what to expect
 
 While an episode is active, the per-turn prompt is O(1) in episode length —
@@ -128,6 +157,11 @@ says there shouldn't be one.
   reconstruction ("Skill-state is blocked"). Workaround: `/tree`-navigate above
   the aborted message. A fold-level fix (expiring never-resolved proposals) is
   planned; PRs welcome.
+- While an episode is active, custom messages injected by other extensions —
+  e.g. pi-subagents' async `subagent-notify` completions — are outside the
+  bounded view and never reach the model. Planned fix: include custom messages
+  in the observation window. Until then, prefer foreground delegation during
+  episodes; PRs welcome.
 
 ## Requirements
 
